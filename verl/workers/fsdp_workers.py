@@ -300,8 +300,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         from safetensors import safe_open
 
+        from verl.utils.qat.linear import QATLinear
+
         safetensor_files = glob.glob(f"{model_path}/model*.safetensors")
         loaded_count = 0
+        skipped_count = 0
 
         for sf_path in safetensor_files:
             with safe_open(sf_path, framework="pt") as f:
@@ -314,6 +317,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         for part in module_path.split("."):
                             module = getattr(module, part)
 
+                        if not isinstance(module, QATLinear):
+                            skipped_count += 1
+                            continue
+
                         scale_val = f.get_tensor(key)
                         val = scale_val.item() if scale_val.numel() == 1 else scale_val.max().item()
                         module.input_global_scale.fill_(val)
@@ -322,6 +329,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         amax = amax_val.item() if amax_val.numel() == 1 else amax_val.max().item()
                         module.input_amax.fill_(amax)
                         loaded_count += 1
+
+        if skipped_count > 0:
+            logger.info(f"[QAT W4A4] Skipped {skipped_count} layers not converted to QATLinear (ignored in training)")
 
         if self.rank == 0:
             logger.info(f"[W4A4] Loaded {loaded_count} input scales from checkpoint")
