@@ -194,3 +194,37 @@ def invalidate_all_scales(model: nn.Module):
             count += 1
 
     logger.debug(f"[QAT Fuse] Invalidated scales for {count} QATLinear layers")
+
+
+def sync_qat_input_amax(model: nn.Module):
+    """Synchronize input_amax across all ranks via all_reduce(MAX).
+
+    Must be called OUTSIDE the forward pass (e.g., before weight sync)
+    where all ranks participate. This is safe even for MoE models because
+    it iterates over ALL QATLinear modules regardless of whether they were
+    activated during the last forward pass.
+
+    Why not in forward: MoE experts with 0 routed tokens skip forward()
+    on some ranks, causing all_reduce inside forward to deadlock.
+    """
+    import torch
+    import torch.distributed as dist
+    from verl.utils.qat.linear import QATLinear, FP8_E4M3_MAX, FP4_E2M1_MAX
+
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+
+    scale_factor = FP8_E4M3_MAX * FP4_E2M1_MAX
+    count = 0
+    for module in model.modules():
+        if isinstance(module, QATLinear) and hasattr(module, "input_amax"):
+            if module.input_amax.item() == module._UNINITIALIZED_SCALE:
+                continue
+            dist.all_reduce(module.input_amax, op=dist.ReduceOp.MAX)
+            # Recompute input_global_scale from synchronized amax
+            new_scale = (scale_factor / (module.input_amax.to(torch.float32) + 1e-12)).float().view(1)
+            module.input_global_scale.copy_(new_scale.to(module.input_global_scale.device))
+            count += 1
+
+    if count > 0:
+        logger.info(f"[QAT] Synchronized input_amax for {count} QATLinear layers across {dist.get_world_size()} ranks")

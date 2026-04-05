@@ -174,7 +174,6 @@ class vLLMColocateWorkerExtension:
             from verl.utils.qat import prepare_qat_for_load_weights
 
             prepare_qat_for_load_weights(self.model_runner.model, device=self.device)
-            logger.info("QAT: prepare_qat_for_load_weights completed")
         elif use_standard_weight_load:
             # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
             patch_vllm_moe_model_weight_loader(self.model_runner.model)

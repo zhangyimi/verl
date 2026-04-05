@@ -268,13 +268,16 @@ class QATLinear(nn.Linear):
         return self.input_amax.item() != self._UNINITIALIZED_SCALE
 
     def _update_input_global_scale(self, x: torch.Tensor):
-        """Update static input_global_scale based on observer strategy."""
+        """Update static input_global_scale based on observer strategy.
+
+        Note: all_reduce is NOT done here because MoE experts with 0 routed
+        tokens skip forward() on some ranks, causing all_reduce to deadlock.
+        Cross-rank synchronization is done separately via sync_qat_input_amax()
+        in core.py, called before weight sync (outside forward, all ranks participate).
+        """
         assert self.mode == QATMode.W4A4, "_update_input_global_scale should only be called in W4A4 mode"
 
         current_amax = torch.amax(torch.abs(x)).detach().to(torch.float32)
-
-        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            torch.distributed.all_reduce(current_amax, op=torch.distributed.ReduceOp.MAX)
 
         scale_factor = FP8_E4M3_MAX * FP4_E2M1_MAX
 

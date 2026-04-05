@@ -36,6 +36,7 @@ from verl.utils.qat.core import (
     enable_qat_fuse,
     invalidate_all_scales,
     load_quantization_config,
+    sync_qat_input_amax,
 )
 from verl.utils.qat.vllm_patch import (
     apply_qat_patches,
@@ -50,6 +51,7 @@ __all__ = [
     "load_quantization_config",
     "enable_qat_fuse",
     "invalidate_all_scales",
+    "sync_qat_input_amax",
     # vLLM Patch
     "apply_qat_patches",
     "manual_process_weights_after_loading",

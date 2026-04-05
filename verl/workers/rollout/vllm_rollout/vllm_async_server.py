@@ -240,6 +240,14 @@ class vLLMHttpServer:
         quantization = self.config.quantization
         hf_overrides = {}
 
+        # Disable FlashInfer MoE FP4 to use VLLM_CUTLASS backend instead.
+        # FlashInfer TRT-LLM backend allocates GPU memory via TVM-FFI/cudaMalloc
+        # that is not tracked by cumem, causing ~89G leak after sleep.
+        # VLLM_CUTLASS uses PyTorch-managed memory and does not have this issue.
+        # TODO: remove after FlashInfer memory issue is resolved upstream.
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP4"] = "0"
+        logger.info("Set VLLM_USE_FLASHINFER_MOE_FP4=0 to use VLLM_CUTLASS backend")
+
         # Handle QAT (Quantization-Aware Training) configuration
         qat_config_dict = getattr(self.config, "qat", {}) or {}
         if qat_config_dict.get("enable", False):

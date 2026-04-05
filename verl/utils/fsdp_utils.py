@@ -212,6 +212,11 @@ def offload_fsdp_optimizer(optimizer):
             for key, value in state.items():
                 if isinstance(value, torch.Tensor):
                     state[key] = value.to("cpu", non_blocking=True)
+    # non_blocking=True D2H copies don't release GPU memory until the CUDA stream
+    # completes. Without sync, all source tensors accumulate on GPU.
+    # See: https://github.com/pytorch/pytorch/issues/137951
+    torch.cuda.synchronize()
+    get_torch_device().empty_cache()
 
 
 @torch.no_grad()

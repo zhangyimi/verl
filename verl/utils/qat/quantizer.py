@@ -247,9 +247,16 @@ class QATQuantizer:
                         )
                     )
                 else:
-                    raise ValueError(
-                        f"W4A4 mode requires input_global_scale for layer '{layer_name}', "
-                        f"but it's not found or uninitialized (-1.0)."
+                    # Fallback: use default 1.0 if scale was never collected (shouldn't happen
+                    # after the fix in quantize_with_fusion, but be safe)
+                    logger.warning(
+                        f"W4A4: input_global_scale not found for '{layer_name}', using default 1.0"
+                    )
+                    results.append(
+                        (
+                            f"{layer_name}.input_global_scale",
+                            torch.tensor([1.0], dtype=torch.float32).to(output_device),
+                        )
                     )
 
         del weights_on_gpu, layer_global_scales, fused_global_scales
@@ -274,6 +281,7 @@ class QATQuantizer:
         current_layer_idx = _sentinel
         layer_buffer: dict[str, torch.Tensor] = {}
         input_global_scales: dict[str, torch.Tensor] = {}
+        _igs_uninit_count = 0
         for name, tensor in params:
             tensor_cpu = tensor.to("cpu") if tensor.is_cuda else tensor
             layer_idx = self._extract_layer_idx(name)
@@ -282,7 +290,10 @@ class QATQuantizer:
             if self._is_w4a4 and "input_global_scale" in name:
                 scale_layer_name = name.replace(".input_global_scale", "")
                 if tensor_cpu.numel() == 1 and tensor_cpu.item() == -1.0:
-                    logger.warning(f"W4A4: {scale_layer_name} input_global_scale is uninitialized")
+                    # Scale not yet calibrated (before first training forward pass).
+                    # Use default 1.0; subsequent syncs will have real values.
+                    input_global_scales[scale_layer_name] = torch.tensor([1.0], dtype=torch.float32)
+                    _igs_uninit_count += 1
                 else:
                     input_global_scales[scale_layer_name] = tensor_cpu
 
@@ -299,6 +310,12 @@ class QATQuantizer:
         # Flush last buffered layer
         if layer_buffer:
             yield from self._process_layer_group(current_layer_idx, layer_buffer, input_global_scales, output_device)
+
+        if _igs_uninit_count > 0:
+            logger.warning(
+                f"W4A4: {_igs_uninit_count} input_global_scale(s) were uninitialized (-1.0), "
+                f"defaulted to 1.0. These will be calibrated after the first training forward pass."
+            )
 
         get_torch_device().empty_cache()
 

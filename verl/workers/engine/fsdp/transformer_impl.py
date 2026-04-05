@@ -753,6 +753,14 @@ class FSDPEngine(BaseEngine):
                     params = self.module.state_dict()
                     params = normalize_peft_param_name(params)
         else:
+            # Sync QATLinear input_amax across ranks before extracting state_dict.
+            # This ensures all ranks agree on the global max activation magnitude.
+            # Cannot be done inside QATLinear.forward() because MoE experts with
+            # 0 routed tokens skip forward on some ranks → all_reduce deadlock.
+            if self._qat_enabled:
+                from verl.utils.qat import sync_qat_input_amax
+                sync_qat_input_amax(self.module)
+
             params = self.module.state_dict()
 
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
