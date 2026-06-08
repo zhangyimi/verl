@@ -1,0 +1,150 @@
+#!/bin/bash
+# Megatron QAT (dense) training on GB200 — vLLM 0.20.0.
+# Plain DAPO/GRPO with NVFP4 QAT. See MEGATRON_QAT_README.md for details.
+#
+# Usage:   sbatch train_megatron.job <TASK>
+#   TASK ∈ {8B_bf16, 8B_w4a16_FFN, 8B_w4a16_full, 8B_w4a4_FFN, 8B_w4a4_full}
+#
+#SBATCH --account=general_sa
+#SBATCH --exclusive
+#SBATCH --partition=batch,36x2-a01r,tcpo
+#SBATCH --job-name=general_sa-verl:megatron-dense
+#SBATCH --mail-type=ALL
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=05:00:00
+#SBATCH --output=/lustre/fsw/general_sa/shuazhang/python_space/verl_for_nvfp4_20251031/verl_megatron_qat_dense/slurm/%j.out
+#SBATCH --error=/lustre/fsw/general_sa/shuazhang/python_space/verl_for_nvfp4_20251031/verl_megatron_qat_dense/slurm/%j.err
+#SBATCH --nodes=8
+
+set -euo pipefail
+
+export PYTHONUNBUFFERED=1
+export UNBUFFERED=1
+
+CONTAINER="/lustre/fsw/general_sa/shuazhang/images/verl.vllm020.megatron.v4.sqsh"
+MOUNTS="/lustre/fsw/general_sa/shuazhang:/lustre/fsw/general_sa/shuazhang"
+WANDB_NETRC_SRC="/home/shuazhang/.netrc"
+if [ -f "$WANDB_NETRC_SRC" ]; then
+    MOUNTS="${MOUNTS},${WANDB_NETRC_SRC}:/root/.netrc,${WANDB_NETRC_SRC}:/home/shuazhang/.netrc"
+fi
+VERL_DIR="/lustre/fsw/general_sa/shuazhang/python_space/verl_for_nvfp4_20251031/verl_megatron_qat_dense"
+MODELS_ROOT="/lustre/fsw/general_sa/shuazhang/models/Qwen"
+DATA_DIR="${VERL_DIR}/data"
+
+# Training / evaluation data. Override via env; defaults live under ${DATA_DIR}.
+TRAIN_FILE="${TRAIN_FILE:-${DATA_DIR}/dapo-math-17k.parquet}"
+TEST_FILE="${TEST_FILE:-${DATA_DIR}/aime-2024.parquet}"
+
+WBPROJECT="${project_name:-DAPO-NVFP4-QAT}"
+
+CUDA_ENV="export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas && \
+export PATH=/usr/local/cuda/bin:\$PATH && \
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH"
+if [ -n "${WANDB_API_KEY:-}" ]; then
+    CUDA_ENV="${CUDA_ENV} && export WANDB_API_KEY=${WANDB_API_KEY}"
+fi
+
+# ===== Ray cluster bootstrap =====
+nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+nodes_array=( $nodes )
+node_1=${nodes_array[0]}
+ip=$node_1
+port=6379
+ip_head=$ip:$port
+export ip_head
+echo "IP Head: $ip_head"
+
+echo "STARTING HEAD at $node_1"
+srun --nodes=1 --ntasks=1 -w "$node_1" --container-image="$CONTAINER" --container-mounts="$MOUNTS" bash -c \
+    "$CUDA_ENV && ray start --head --node-ip-address=$ip --port=$port --dashboard-host=0.0.0.0 --block" &
+sleep 10s
+
+NNODES=$((SLURM_JOB_NUM_NODES))
+for ((i = 1; i < NNODES; i++)); do
+    node_i=${nodes_array[$i]}
+    echo "STARTING WORKER $i at $node_i"
+    srun --nodes=1 --ntasks=1 -w "$node_i" --container-image="$CONTAINER" --container-mounts="$MOUNTS" bash -c \
+        "$CUDA_ENV && ray start --address $ip_head --block" &
+    sleep 1s
+done
+
+# ===== TASK selection (dense only) =====
+TASK=${1:-8B_w4a4_FFN}
+MODEL_NAME=Qwen3-8B-Base
+if [ "$TASK" == "8B_bf16" ]; then
+    SCRIPT_NAME=run_qwen3_8b_bf16_megatron.sh
+    exp_name=${exp_name:-gb200_8B_bf16_megatron_dense}
+elif [ "$TASK" == "8B_w4a16_FFN" ]; then
+    SCRIPT_NAME=run_qwen3_8b_w4a16_megatron_FFN_only.sh
+    exp_name=${exp_name:-gb200_8B_w4a16_megatron_FFN_dense}
+elif [ "$TASK" == "8B_w4a16_full" ]; then
+    SCRIPT_NAME=run_qwen3_8b_w4a16_megatron_full.sh
+    exp_name=${exp_name:-gb200_8B_w4a16_megatron_full_dense}
+elif [ "$TASK" == "8B_w4a4_FFN" ]; then
+    SCRIPT_NAME=run_qwen3_8b_w4a4_megatron_FFN_only.sh
+    exp_name=${exp_name:-gb200_8B_w4a4_megatron_FFN_dense}
+elif [ "$TASK" == "8B_w4a4_full" ]; then
+    SCRIPT_NAME=run_qwen3_8b_w4a4_megatron_full.sh
+    exp_name=${exp_name:-gb200_8B_w4a4_megatron_full_dense}
+else
+    echo "Invalid task: $TASK"
+    echo "Valid: 8B_bf16, 8B_w4a16_FFN, 8B_w4a16_full, 8B_w4a4_FFN, 8B_w4a4_full"
+    exit 1
+fi
+
+MODEL_PATH="${MODELS_ROOT}/${MODEL_NAME}"
+mkdir -p "${DATA_DIR}"
+for f in "${TRAIN_FILE}" "${TEST_FILE}"; do
+    [ -f "$f" ] || { echo "Data file not found: $f (set TRAIN_FILE/TEST_FILE)"; exit 1; }
+done
+
+# Production overrides: GB200 4 GPU/node. If total_training_steps is supplied,
+# preserve it (single-node smoke); otherwise leave long chains uncapped.
+if [ -n "${total_training_steps:-}" ]; then
+    TRAINING_STEPS_OVERRIDE="export total_training_steps=${total_training_steps}"
+else
+    TRAINING_STEPS_OVERRIDE="unset total_training_steps"
+fi
+PROD_OVERRIDES="export project_name=${WBPROJECT} && \
+export n_gpus_per_node=${n_gpus_per_node:-4} && \
+export save_freq=${save_freq:-5} && \
+export test_freq=${test_freq:-10} && \
+export max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep:-1} && \
+export enforce_eager=${enforce_eager:-False} && \
+${TRAINING_STEPS_OVERRIDE}"
+
+cmd=$(cat <<ENDCMD
+echo "*******STARTING (task=${TASK})********" &&
+${CUDA_ENV} &&
+ray start --address ${ip_head} --num-cpus 0 --num-gpus 0 &&
+ray status &&
+if [ -n "\${WANDB_API_KEY:-}" ]; then wandb login "\${WANDB_API_KEY}" >/dev/null 2>&1 && echo "W&B login configured"; elif [ -f "\${HOME:-/root}/.netrc" ] || [ -f /root/.netrc ] || [ -f /home/shuazhang/.netrc ]; then echo "Using mounted W&B netrc credentials"; else echo "W&B credentials not found"; exit 2; fi &&
+JOBLOG="${VERL_DIR}/ray_log/${exp_name}_\${SLURM_JOB_ID:-\$$}.log" &&
+mkdir -p \$(dirname \$JOBLOG) &&
+unset RAY_ADDRESS &&
+export RAY_RUNTIME_ENV_TEMPORARY_REFERENCE_EXPIRATION_S=3600 &&
+export VERL_HOME=${VERL_DIR} &&
+export RAY_DATA_HOME=${VERL_DIR} &&
+export MODEL_PATH=${MODEL_PATH} &&
+export TRAIN_FILE=${TRAIN_FILE} &&
+export TEST_FILE=${TEST_FILE} &&
+export NNODES=${NNODES} &&
+cd ${VERL_DIR} &&
+export PYTHONPATH=${VERL_DIR}:\${PYTHONPATH:-} &&
+export exp_name=${exp_name} &&
+export WANDB_RUN_ID=${exp_name} &&
+export WANDB_RESUME=allow &&
+export extra_hydra_args="${extra_hydra_args:-}" &&
+${PROD_OVERRIDES} &&
+${CUDA_ENV} &&
+echo "===== effective overrides =====" &&
+echo "n_gpus_per_node=\${n_gpus_per_node} save_freq=\${save_freq} test_freq=\${test_freq}" &&
+echo "task=${TASK} script=${SCRIPT_NAME} model=${MODEL_PATH}" &&
+echo "exp_name=\${exp_name} project_name=\${project_name}" &&
+echo "===== launching recipe =====" &&
+stdbuf -oL -eL bash recipe/qat/${SCRIPT_NAME} 2>&1 | tee -a \${JOBLOG}
+ENDCMD
+)
+
+srun --overlap --nodes=1 --ntasks=1 -w "$node_1" --container-image="$CONTAINER" --container-mounts="$MOUNTS" bash -c "$cmd"
+echo "$(date '+%Y-%m-%d %H:%M:%S') Job ${SLURM_JOB_ID} stopped ..."
