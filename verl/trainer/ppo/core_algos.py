@@ -1178,12 +1178,18 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
         if loss_agg_mode == "seq-mean-token-sum-norm":
             if loss_scale_factor is None:
                 horizon = loss_mask.shape[-1]
                 loss_scale_factor = horizon
-            loss /= loss_scale_factor
+            if torch.is_tensor(loss_scale_factor):
+                seq_scale = loss_scale_factor.to(device=seq_losses.device, dtype=seq_losses.dtype)
+                seq_losses = seq_losses / seq_scale.clamp_min(1e-8)
+                loss_scale_factor = None
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            if loss_scale_factor is not None:
+                loss /= loss_scale_factor
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean

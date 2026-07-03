@@ -54,6 +54,12 @@ from verl.workers.rollout.vllm_rollout.utils import (
 )
 
 _VLLM_VERSION = version.parse(vllm.__version__)
+_QAT_DEBUG_ENABLED = os.environ.get("VERL_QAT_DEBUG", "0") == "1"
+
+
+def _qat_debug(message: str) -> None:
+    if _QAT_DEBUG_ENABLED:
+        print(f"[QAT-DEBUG] {message}", flush=True)
 
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -782,6 +788,19 @@ class vLLMHttpServer:
 
         # Handle QAT (Quantization-Aware Training) configuration
         qat_config_dict = getattr(self.config, "qat", {}) or {}
+        _qat_debug(
+            "vllm_async_server.launch_server: "
+            f"self.config keys={list(self.config.keys()) if hasattr(self.config, 'keys') else type(self.config).__name__}"
+        )
+        _qat_debug(
+            "qat_config_dict "
+            f"type={type(qat_config_dict).__name__} "
+            f"content={dict(qat_config_dict) if hasattr(qat_config_dict, 'keys') else qat_config_dict}"
+        )
+        _qat_debug(
+            "qat_config_dict.get('enable', False) = "
+            f"{qat_config_dict.get('enable', False) if hasattr(qat_config_dict, 'get') else 'N/A'}"
+        )
         if qat_config_dict.get("enable", False):
             from verl.utils.qat import QATConfig, load_quantization_config
 
@@ -790,9 +809,13 @@ class vLLMHttpServer:
             quant_method = quantization_config_dict.get("quant_method", None)
 
             if quant_method == "modelopt":
+                # Worker subprocesses inherit env vars at fork — let them pick up the mode.
+                import os
+
                 from verl.utils.modelopt import apply_modelopt_nvfp4_patches
 
-                apply_modelopt_nvfp4_patches()
+                os.environ["VERL_QAT_MODE"] = qat_config.mode
+                apply_modelopt_nvfp4_patches(mode=qat_config.mode)
                 quantization = "modelopt"
             elif quant_method == "compressed-tensors":
                 from verl.utils.qat import apply_qat_patches
@@ -804,6 +827,11 @@ class vLLMHttpServer:
 
             logger.info(f"QAT quantization config injected (quant_method={quant_method})")
             hf_overrides["quantization_config"] = quantization_config_dict
+            # For QAT, force load_format=dummy: vLLM should NOT load BF16 base from disk into
+            # quantized slots (causes shape mismatch). Initialize with random quantized weights;
+            # the trainer will sync real quantized weights via update_weights() before any rollout.
+            _qat_debug(f"forcing load_format=dummy (was {self.config.load_format})")
+            self.config.load_format = "dummy"
         elif quantization is not None:
             # Handle other quantization methods (fp8, torchao)
             _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]

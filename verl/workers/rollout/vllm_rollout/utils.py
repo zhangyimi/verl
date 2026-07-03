@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import threading
 from types import MethodType
@@ -26,7 +27,10 @@ from vllm.outputs import RequestOutput
 
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
-from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from verl.utils.vllm.patch import (
+    patch_vllm_moe_model_weight_loader,
+    patch_vllm_unquantized_moe_process_weights_after_loading,
+)
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 
 try:
@@ -47,6 +51,12 @@ _OmniWorkerBase = CustomPipelineWorkerExtension if _VLLM_OMNI_AVAILABLE else obj
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+_QAT_DEBUG_ENABLED = os.environ.get("VERL_QAT_DEBUG", "0") == "1"
+
+
+def _qat_debug(message: str) -> None:
+    if _QAT_DEBUG_ENABLED:
+        print(f"[QAT-DEBUG] {message}", flush=True)
 
 # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
 VLLM_LORA_INT_ID = 123
@@ -119,6 +129,90 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     model.compute_logits = MethodType(compute_logits, model)
 
 
+_MOE_SCALE_NAME_RE = re.compile(
+    r"layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(input_scale|weight_scale_2)$"
+)
+_MOE_LAYER_IDX_RE = re.compile(r"layers\.(\d+)\b")
+
+
+def _write_fused_scale(param, idx, val) -> int:
+    """Write a per-expert scalar scale into a fused MoE scale param. Returns 1 on success."""
+    if param is None or val is None:
+        return 0
+    data = param.data if hasattr(param, "data") else param
+    try:
+        data[idx] = val.to(device=data.device, dtype=data.dtype).reshape(())
+        return 1
+    except Exception:
+        return 0
+
+
+def _apply_moe_scale_stash(model, stash) -> None:
+    """Populate vLLM's FUSED MoE scale params from stashed per-expert HF scales.
+
+    Online weight sync exports per-expert, per-projection scales
+    (``experts.{E}.{gate,up,down}_proj.{input_scale,weight_scale_2}``) but vLLM's
+    fused MoE loader does not route them into ``w13_input_scale (E,2)`` /
+    ``w2_input_scale (E,)`` / ``w13_weight_scale_2 (E,2)`` / ``w2_weight_scale_2 (E,)``
+    on reload, leaving them as uninitialized ``torch.empty`` garbage (signed ~1e-3).
+    We re-apply them here, just before ``process_weights_after_loading`` runs the
+    NVFP4 kernel-format convert. Gate->w13 col0, up->w13 col1, down->w2.
+    """
+    if os.environ.get("VERL_MOE_SCALE_STASH_FIX", "1").lower() in ("0", "false", "no"):
+        return
+    if not stash:
+        return
+    parsed: dict = {}
+    for name, tensor in stash.items():
+        m = _MOE_SCALE_NAME_RE.search(name)
+        if m is None:
+            continue
+        layer_idx, expert_id, role, kind = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
+        parsed.setdefault((layer_idx, expert_id), {})[(role, kind)] = tensor
+    if not parsed:
+        return
+
+    applied = 0
+    for mod_name, module in model.named_modules():
+        if not hasattr(module, "w13_input_scale"):
+            continue
+        lm = _MOE_LAYER_IDX_RE.search(mod_name)
+        if lm is None:
+            continue
+        layer_idx = int(lm.group(1))
+        entries = {E: kv for (L, E), kv in parsed.items() if L == layer_idx}
+        if not entries:
+            continue
+        map_fn = getattr(module, "_map_global_expert_id_to_local_expert_id", None)
+
+        def _local(expert_id):
+            if map_fn is None:
+                return int(expert_id)
+            try:
+                v = map_fn(int(expert_id))
+                return int(v.item()) if hasattr(v, "item") else int(v)
+            except Exception:
+                return -1
+
+        w13_input = getattr(module, "w13_input_scale", None)
+        w13_wscale2 = getattr(module, "w13_weight_scale_2", None)
+        w2_input = getattr(module, "w2_input_scale", None)
+        w2_wscale2 = getattr(module, "w2_weight_scale_2", None)
+        for expert_id, kv in entries.items():
+            local = _local(expert_id)
+            if local < 0:
+                continue
+            for role, col in (("gate_proj", 0), ("up_proj", 1)):
+                applied += _write_fused_scale(w13_input, (local, col), kv.get((role, "input_scale")))
+                applied += _write_fused_scale(w13_wscale2, (local, col), kv.get((role, "weight_scale_2")))
+            applied += _write_fused_scale(w2_input, local, kv.get(("down_proj", "input_scale")))
+            applied += _write_fused_scale(w2_wscale2, local, kv.get(("down_proj", "weight_scale_2")))
+    _qat_debug(
+        f"_apply_moe_scale_stash: wrote {applied} fused MoE scale entries "
+        f"from {len(parsed)} (layer,expert) pairs"
+    )
+
+
 class vLLMColocateWorkerExtension:
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
@@ -144,8 +238,19 @@ class vLLMColocateWorkerExtension:
         # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading
         vllm_config = kwargs.get("vllm_config")
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
+        _qat_debug(
+            "vLLMColocateWorkerExtension.__new__: "
+            f"vllm_config={vllm_config is not None}, "
+            f"quant_config type={type(quant_config).__name__ if quant_config else None}, "
+            f"quant_config repr={repr(quant_config)[:300] if quant_config else None}"
+        )
+        if quant_config:
+            _qat_debug(f"quant_config dir={[a for a in dir(quant_config) if not a.startswith('_')][:20]}")
+            _qat_debug(f"quant_format={getattr(quant_config, 'quant_format', 'NO_ATTR')}")
+            _qat_debug(f"quant_method={getattr(quant_config, 'quant_method', 'NO_ATTR')}")
         _is_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
         _is_modelopt_qat = type(quant_config).__name__ == "ModelOptNvFp4Config"
+        _qat_debug(f"_is_qat_model={_is_qat_model}, _is_modelopt_qat={_is_modelopt_qat}")
         if _is_qat_model:
             from verl.utils.qat import apply_qat_patches
 
@@ -154,7 +259,14 @@ class vLLMColocateWorkerExtension:
         elif _is_modelopt_qat:
             from verl.utils.modelopt import apply_modelopt_nvfp4_patches
 
-            apply_modelopt_nvfp4_patches()
+            _qat_mode = os.environ.get("VERL_QAT_MODE", "w4a4")
+            apply_modelopt_nvfp4_patches(mode=_qat_mode)
+            _qat_debug(f"apply_modelopt_nvfp4_patches(mode={_qat_mode}) called in worker subprocess")
+            # Verify the patch was actually applied:
+            from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4LinearMethod
+
+            pwal_name = ModelOptNvFp4LinearMethod.process_weights_after_loading.__qualname__
+            _qat_debug(f"ModelOptNvFp4LinearMethod.process_weights_after_loading is now: {pwal_name}")
             logger.info("Applied ModelOpt NVFP4 patches in vLLM worker subprocess")
 
         # TODO: For ascend NPU, when the corresponding vllm-ascend version is upgraded to v0.13.0,
@@ -193,6 +305,14 @@ class vLLMColocateWorkerExtension:
             self.model_runner.vllm_config
         )
 
+        # Optional instance-attribute survival diagnostics.
+        _qat_debug(
+            f"update_weights_from_ipc: hasattr _is_modelopt_qat={hasattr(self, '_is_modelopt_qat')}, "
+            f"_is_qat_model={getattr(self, '_is_qat_model', 'UNSET')}, "
+            f"_is_modelopt_qat={getattr(self, '_is_modelopt_qat', 'UNSET')}, "
+            f"use_standard_weight_load={use_standard_weight_load}"
+        )
+
         if self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
             from verl.utils.qat import prepare_qat_for_load_weights
@@ -229,12 +349,16 @@ class vLLMColocateWorkerExtension:
         elif self._is_modelopt_qat:
             from verl.utils.modelopt.vllm_modelopt_patch import modelopt_process_weights_after_loading
 
+            # Re-apply per-expert MoE scales into fused params before the
+            # NVFP4 kernel-format convert reads them (vLLM's fused loader drops them on reload).
+            _apply_moe_scale_stash(self.model_runner.model, getattr(self, "_verl_moe_scale_stash", None))
             modelopt_process_weights_after_loading(self.model_runner.model)
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
         elif use_standard_weight_load:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
+            patch_vllm_unquantized_moe_process_weights_after_loading()
             model = self.model_runner.model
             model_config = self.model_runner.vllm_config.model_config
             process_weights_after_loading(model, model_config, self.device)
@@ -260,6 +384,43 @@ class vLLMColocateWorkerExtension:
                 loaded_params = load_quanted_weights(weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
+                if getattr(self, "_is_modelopt_qat", False):
+                    # Stash per-expert MoE activation/global scales across buckets; vLLM's
+                    # fused MoE loader drops them on reload (-> _apply_moe_scale_stash in finalize).
+                    stash = getattr(self, "_verl_moe_scale_stash", None)
+                    if stash is None:
+                        stash = {}
+                        self._verl_moe_scale_stash = stash
+                    for _name, _t in weights:
+                        if "experts." in _name and (_name.endswith(".input_scale") or _name.endswith(".weight_scale_2")):
+                            try:
+                                stash[_name] = _t.detach().to("cpu")
+                            except Exception:
+                                pass
+                    log_count = getattr(self, "_modelopt_input_scale_bucket_log_count", 0)
+                    if log_count < 16:
+                        def _vstat(_t):
+                            try:
+                                _f = _t.detach().float()
+                                return (f"shape={tuple(_t.shape)} min={_f.min().item():.6g} "
+                                        f"max={_f.max().item():.6g} mean={_f.mean().item():.6g}")
+                            except Exception as _e:  # pragma: no cover - debug only
+                                return f"<{type(_t).__name__}:{_e}>"
+                        input_scale_names = [name for name, _tensor in weights if "input_scale" in name]
+                        # Optionally report exported MoE-expert scale values to distinguish
+                        # incorrect export from scales dropped during loading.
+                        moe_scale_samples = [
+                            (name, t) for name, t in weights
+                            if "experts." in name and ("input_scale" in name or "weight_scale_2" in name)
+                        ]
+                        if input_scale_names or log_count < 4:
+                            shown = "; ".join(f"{n} {_vstat(t)}" for n, t in moe_scale_samples[:4])
+                            _qat_debug(
+                                f"ModelOpt reload bucket input_scale_count={len(input_scale_names)} "
+                                f"moe_scale_count={len(moe_scale_samples)} sample_names={input_scale_names[:4]} "
+                                f"moe_scale_values=[{shown}]"
+                            )
+                        setattr(self, "_modelopt_input_scale_bucket_log_count", log_count + 1)
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
 

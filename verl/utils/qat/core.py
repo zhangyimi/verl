@@ -37,6 +37,8 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    calib_data_path: Optional[str] = None
+    calib_size: int = 32
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
@@ -54,6 +56,19 @@ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
         quant_config["ignore"] = qat_config.ignore_patterns
         if original_ignore != qat_config.ignore_patterns:
             logger.info(f"Overriding JSON 'ignore' field: {original_ignore} -> {qat_config.ignore_patterns}")
+
+    # vLLM 0.20's ModelOptNvFp4Config.from_config reads `exclude_modules` (NOT `ignore`).
+    # Strip `re:` prefix that vLLM doesn't understand, and pass through the rest. vLLM
+    # treats patterns containing '*' or '.' as regex (`.` → `\.`, `*` → `.*`, fullmatch).
+    if qat_config.ignore_patterns:
+        exclude_modules = []
+        for p in qat_config.ignore_patterns:
+            if p.startswith("re:"):
+                exclude_modules.append(p[3:])
+            else:
+                exclude_modules.append(p)
+        quant_config["exclude_modules"] = exclude_modules
+        logger.info(f"Set 'exclude_modules' (for vLLM modelopt path): {exclude_modules}")
 
     logger.info("Successfully loaded QAT quantization config")
     return quant_config

@@ -466,7 +466,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if qat_config.get("enable", False):
                 from verl.utils.modelopt import apply_qat_to_modules
 
-                actor_module = apply_qat_to_modules(actor_module, qat_config)
+                actor_module = apply_qat_to_modules(
+                    actor_module, qat_config, model_path=getattr(self, "local_path", None)
+                )
         elif self._is_ref:
             wrap_config = McoreModuleWrapperConfig(
                 is_value_model=False,  # ref is not value model

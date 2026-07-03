@@ -303,6 +303,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
 
+            # Periodic W4A4/W4A8 activation-amax re-calibration. Done here (not in the engine's
+            # per-minibatch optimizer_step) so the counter == train-step count, and inside the
+            # train_mode context so the model is on GPU. All train-mesh ranks reach this in
+            # lockstep -> the max_calibrate DP/EP/TP all_reduce is collective-safe.
+            self._maybe_recalibrate_qat()
+
             if self.engine.is_mp_src_rank_with_outputs():
                 actor_output = [tu.get(output, "metrics") for output in output_lst]
                 metrics = {}
@@ -321,6 +327,66 @@ class TrainingWorker(Worker, DistProfilerExtension):
             else:
                 output = None
         return output
+
+    def _maybe_recalibrate_qat(self):
+        """Refresh the frozen W4A4/W4A8 activation amax every ``qat.recalib_every`` train steps.
+
+        Re-runs modelopt max-calibration on the current model (FSDP-equivalent adaptive amax;
+        weight amax restored so only the activation scale changes). No-op unless the QAT engine
+        config sets ``recalib_every > 0`` and the module was calibrated (has ``_qat_recalib_ctx``).
+        """
+        # Cache `every` ONCE. Reading self.engine._qat_config.recalib_every every call caused the
+        # counter to stall after ~step 20 (recalib fired only once): the engine's _qat_config gets
+        # reset/churned mid-run (e.g., across a checkpoint save), so `every` went 0 -> early return
+        # BEFORE the counter incremented. Caching + always-incrementing makes firing robust.
+        if not hasattr(self, "_recalib_every"):
+            import os as _os
+
+            qc0 = getattr(self.engine, "_qat_config", None)
+            self._recalib_every = int(getattr(qc0, "recalib_every", 0) or 0) if qc0 is not None else 0
+            self._recalib_logfile = _os.path.join(_os.getcwd(), "recalib_events.log")
+        every = self._recalib_every
+        self._recalib_step = getattr(self, "_recalib_step", 0) + 1  # ALWAYS advance
+        if every <= 0 or self._recalib_step % every != 0:
+            return
+        rank0 = torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+        modules = getattr(self.engine, "module", None)
+        model_path = getattr(getattr(self, "model_config", None), "local_path", None) or getattr(
+            getattr(self.engine, "model_config", None), "local_path", None
+        )
+        if not getattr(self, "_recalib_prompts", None):
+            qc = getattr(self.engine, "_qat_config", None)
+            from verl.utils.modelopt.qat_utils import _load_calib_prompts
+
+            self._recalib_prompts = _load_calib_prompts(
+                getattr(qc, "calib_data_path", None), n=int(getattr(qc, "calib_size", 32) or 32)
+            )
+        n_mod = len(modules) if modules else 0
+        n_prompt = len(self._recalib_prompts or [])
+
+        def _flog(msg):
+            # Reliable, Ray-stdout-throttle-proof confirmation of every fire (rank 0 -> shared file).
+            if not rank0:
+                return
+            try:
+                with open(self._recalib_logfile, "a") as fh:
+                    fh.write(msg + "\n")
+            except Exception:
+                pass
+
+        if not modules or not model_path or not n_prompt:
+            _flog(f"step={self._recalib_step} SKIP n_mod={n_mod} model_path={bool(model_path)} n_prompts={n_prompt}")
+            return
+        from verl.utils.modelopt.qat_utils import recalibrate_input_amax
+
+        n = recalibrate_input_amax(modules, model_path, self._recalib_prompts)
+        _flog(f"step={self._recalib_step} OK recalibrated_chunks={n} every={every}")
+        if rank0:
+            print(
+                f"[QAT-RECALIB] refreshed activation amax on {n} chunk(s) at train step "
+                f"{self._recalib_step} (every={every})",
+                flush=True,
+            )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @DistProfiler.annotate(color="red", role="train_batch")

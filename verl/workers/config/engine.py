@@ -144,6 +144,14 @@ class QATEngineConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    # Path to a parquet of prompts for W4A4/W4A8 input-activation calibration.
+    # Required for W4A4/W4A8 (Ray workers don't inherit the recipe's TRAIN_FILE env).
+    calib_data_path: Optional[str] = None
+    calib_size: int = 32
+    # Periodic activation-amax re-calibration: every N train steps the engine re-runs modelopt
+    # max-calibration to refresh the otherwise-frozen input_quantizer amax (0 = off). The actor
+    # is read at TrainingWorker.train_mini_batch via self.engine._qat_config.recalib_every.
+    recalib_every: int = 0
 
 
 @dataclass

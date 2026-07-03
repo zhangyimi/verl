@@ -1418,6 +1418,54 @@ class RayPPOTrainer:
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
+                    actor_cfg = self.config.actor_rollout_ref.actor
+                    if bool(actor_cfg.get("local_segment_align_adaptive_tail_enable", False)):
+                        response_mask_for_tail = batch.batch["response_mask"].to(torch.bool)
+                        response_lengths_for_tail = response_mask_for_tail.to(torch.float32).sum(dim=-1).clamp_min(1.0)
+                        seq_active_for_tail = response_mask_for_tail.any(dim=-1)
+                        if seq_active_for_tail.any():
+                            step_mean = response_lengths_for_tail[seq_active_for_tail].mean()
+                            max_response_len = float(response_mask_for_tail.shape[-1])
+                            step_clip_ratio = (
+                                (response_lengths_for_tail >= max_response_len) & seq_active_for_tail
+                            ).to(torch.float32).mean()
+                            adaptive_offset = float(actor_cfg.get("local_segment_align_adaptive_tail_offset", 4096.0))
+                            adaptive_min_start = float(
+                                actor_cfg.get("local_segment_align_adaptive_tail_min_start", 8192.0)
+                            )
+                            adaptive_max_start = float(
+                                actor_cfg.get("local_segment_align_adaptive_tail_max_start", 14336.0)
+                            )
+                            adaptive_width = max(
+                                float(actor_cfg.get("local_segment_align_adaptive_tail_width", 4096.0)), 1e-6
+                            )
+                            adaptive_start = torch.clamp(
+                                step_mean + response_lengths_for_tail.new_tensor(adaptive_offset),
+                                min=adaptive_min_start,
+                                max=adaptive_max_start,
+                            )
+                            length_weight = torch.clamp(
+                                (response_lengths_for_tail - adaptive_start) / adaptive_width, min=0.0, max=1.0
+                            )
+                            length_weight = torch.where(
+                                seq_active_for_tail, length_weight, torch.zeros_like(length_weight)
+                            )
+                            tail_mass = length_weight[seq_active_for_tail].mean()
+                        else:
+                            step_mean = response_lengths_for_tail.new_tensor(0.0)
+                            step_clip_ratio = response_lengths_for_tail.new_tensor(0.0)
+                            tail_mass = response_lengths_for_tail.new_tensor(0.0)
+
+                        batch.batch["local_segment_align_step_mean"] = torch.ones_like(
+                            response_lengths_for_tail
+                        ) * step_mean
+                        batch.batch["local_segment_align_step_clip_ratio"] = torch.ones_like(
+                            response_lengths_for_tail
+                        ) * step_clip_ratio
+                        batch.batch["local_segment_align_tail_mass"] = torch.ones_like(
+                            response_lengths_for_tail
+                        ) * tail_mass
+
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     # get images_seqlens
