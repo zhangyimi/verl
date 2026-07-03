@@ -111,6 +111,11 @@ class vLLMHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        if self.config.enable_rollout_routing_replay:
+            # AsyncLLM launches vLLM worker subprocesses after this point.  Set
+            # the production-only capture switch here as a second line of
+            # defence in addition to Ray runtime-env propagation.
+            os.environ["VERL_ROLLOUT_ROUTE_CAPTURE"] = "1"
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
         if self.config.max_model_len is None:
             self.config.max_model_len = max_position_embeddings
@@ -415,6 +420,11 @@ class vLLMHttpServer:
             args.update(lora_args)
 
         if self.config.enable_rollout_routing_replay:
+            # PR #33013 binds the callback at vLLM model-runner initialization.
+            # Execution mode remains an explicit rollout configuration: the
+            # current W4A4 production recipe selects eager because its CUDA
+            # Graph path fails independently of R3, while compile-only probes
+            # can select a different mode without changing route semantics.
             args.update({"enable_return_routed_experts": True})
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)

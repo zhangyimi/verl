@@ -181,6 +181,7 @@ class TestRolloutISIntegration:
         assert "training_ppl" in metrics
         assert "rollout_ppl" in metrics
         assert "kl" in metrics
+        assert "logprob_abs_diff" in metrics
         assert isinstance(metrics["kl"], float)
 
     def test_metrics_only_mode(self, sample_data, config_with_rollout_is):
@@ -202,6 +203,7 @@ class TestRolloutISIntegration:
         # Metrics should be computed
         assert len(is_metrics) > 0
         assert "rollout_corr/rollout_is_mean" in is_metrics
+        assert "rollout_corr/logprob_abs_diff" in is_metrics
 
         # In metrics-only mode, we compute loss WITHOUT applying weights
         # (simulating rollout_is=False)

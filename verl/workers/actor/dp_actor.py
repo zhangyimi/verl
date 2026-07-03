@@ -27,7 +27,14 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_length_quantile_refs,
+    get_policy_loss_fn,
+    kl_penalty,
+    set_adv_length_ref_global,
+    set_seq_norm_p95_global,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -543,6 +550,47 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
+        # Precompute independent whole-batch (cross-DP) response-length
+        # quantiles once per update.  Advantage P70 must not reuse seq P95.
+        set_adv_length_ref_global(None)
+        set_seq_norm_p95_global(None)
+        _adv_stage = str(getattr(self.config, "adv_length_norm_stage", "loss"))
+        if "response_mask" in data.batch and (
+            bool(getattr(self.config, "seq_norm_adaptive_enable", False))
+            or (
+                bool(getattr(self.config, "adv_length_norm_enable", False))
+                and _adv_stage == "loss"
+            )
+        ):
+            _rm = data.batch["response_mask"]
+            _lengths = _rm.sum(dim=-1).float()
+            _local = _lengths[_rm.any(dim=-1)].detach().cpu().tolist()
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            ):
+                # all_gather over the default (world) group: sp_size=1 in these runs so world == DP,
+                # matching the dp_group=None convention used by the loss's global reductions.
+                _gathered = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(_gathered, _local)
+                _all = [v for sub in _gathered if sub for v in sub]
+            else:
+                _all = _local
+            if len(_all) > 0:
+                _adv_ref, _seq_ref = compute_length_quantile_refs(
+                    torch.tensor(_all, dtype=torch.float32),
+                    adv_enabled=(
+                        bool(getattr(self.config, "adv_length_norm_enable", False))
+                        and _adv_stage == "loss"
+                    ),
+                    adv_quantile=float(getattr(self.config, "adv_length_norm_quantile", 0.95)),
+                    seq_enabled=bool(getattr(self.config, "seq_norm_adaptive_enable", False)),
+                    seq_quantile=float(getattr(self.config, "seq_norm_adaptive_quantile", 0.95)),
+                )
+                set_adv_length_ref_global(_adv_ref)
+                set_seq_norm_p95_global(_seq_ref)
+
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
@@ -620,6 +668,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        rollout_log_probs=model_inputs.get("rollout_log_probs", None),
                     )
                     micro_batch_metrics.update(pg_metrics)
 

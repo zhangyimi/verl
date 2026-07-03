@@ -968,9 +968,22 @@ class RayPPOTrainer:
         # load dataloader,
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
+        # Ray does not consistently propagate arbitrary shell environment
+        # variables to the controller actor in every cluster configuration.
+        # Keep the env switch, but also key the one-shot diagnostic off its
+        # dedicated project name so a checkpoint's StatefulDataLoader snapshot
+        # can never replace the fixed diagnostic sample/order.
+        skip_data_state = (
+            os.environ.get("VERL_SKIP_DATA_STATE", "0") == "1"
+            or os.environ.get("VERL_ROUTE_DIAG_SKIP_DATA_STATE", "0") == "1"
+            or os.environ.get("VERL_ROUTE_DIAG_ONLY", "0") == "1"
+            or self.config.trainer.project_name in {"DAPO-NVFP4-ROUTE-DIAG", "DAPO-NVFP4-R3-SMOKE"}
+        )
+        if os.path.exists(dataloader_local_path) and not skip_data_state:
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
+        elif skip_data_state:
+            print("[checkpoint] ignoring checkpoint dataloader state by explicit runtime setting")
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1126,7 +1139,7 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
+    def _compute_old_log_prob(self, batch: DataProto, *, force_rollout_routes: bool = False):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -1134,12 +1147,22 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            tu.assign_non_tensor(
+                batch_td,
+                calculate_entropy=True,
+                compute_loss=False,
+                route_diag_force_rollout_routes=force_rollout_routes,
+            )
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
-            old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+            worker_metrics = tu.get(output, "metrics")
+            old_log_prob_mfu = worker_metrics["mfu"]
+            if not force_rollout_routes:
+                from verl.utils.route_diagnostics import finalize_route_diag_metrics
+
+                self._last_route_diag_metrics = finalize_route_diag_metrics(worker_metrics)
             # step 4. No padding to padding
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
@@ -1150,6 +1173,49 @@ class RayPPOTrainer:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
+
+    def _apply_driver_adv_length_norm(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Apply the GRPO-safe driver stage shared by PPO and DAPO trainers."""
+
+        actor_config = self.config.actor_rollout_ref.actor
+        adv_length_enabled = bool(getattr(actor_config, "adv_length_norm_enable", False))
+        adv_length_stage = str(getattr(actor_config, "adv_length_norm_stage", "loss"))
+        valid_stages = {"disabled", "loss", "driver_group_recenter"}
+        if adv_length_stage not in valid_stages:
+            raise ValueError(f"invalid adv_length_norm_stage={adv_length_stage!r}")
+        if not adv_length_enabled or adv_length_stage != "driver_group_recenter":
+            return batch
+        if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+            raise ValueError("adv_length_norm_stage=driver_group_recenter is supported only for GRPO")
+        if "uid" not in batch.non_tensor_batch:
+            raise KeyError("driver_group_recenter requires uid in the global driver batch")
+
+        recentered, adv_length_metrics = core_algos.apply_group_recentered_adv_length_norm(
+            batch.batch["advantages"],
+            batch.batch["response_mask"],
+            batch.non_tensor_batch["uid"],
+            quantile=float(getattr(actor_config, "adv_length_norm_quantile", 0.95)),
+            alpha=float(getattr(actor_config, "adv_length_norm_alpha", 0.5)),
+            min_scale=float(getattr(actor_config, "adv_length_norm_min_scale", 0.5)),
+            max_scale=float(getattr(actor_config, "adv_length_norm_max_scale", 1.0)),
+            expected_group_size=int(self.config.actor_rollout_ref.rollout.n),
+            mode=str(getattr(actor_config, "adv_length_norm_mode", "neg_only")),
+        )
+        # Returns encode the estimator target and must not be changed by
+        # policy-gradient-only length shaping.
+        batch.batch["advantages"] = recentered
+        metrics.update(adv_length_metrics)
+        print(
+            "[adv-length-driver] applied driver_group_recenter "
+            f"ref={adv_length_metrics['actor/adv_length_norm_ref_len']:.3f} "
+            f"scale_mean={adv_length_metrics['actor/adv_length_norm_scale_mean']:.6f} "
+            f"scaled_fraction={adv_length_metrics['actor/adv_length_norm_scaled_seq_fraction']:.6f} "
+            f"group_mean_abs_pre={adv_length_metrics['actor/adv_length_norm_group_mean_abs_pre']:.8f} "
+            f"group_mean_abs_post={adv_length_metrics['actor/adv_length_norm_group_mean_abs_post']:.8f} "
+            f"group_size={adv_length_metrics['actor/adv_length_norm_group_size']:.0f}",
+            flush=True,
+        )
+        return batch
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1167,6 +1233,9 @@ class RayPPOTrainer:
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
+            adv_length_stage = str(
+                getattr(self.config.actor_rollout_ref.actor, "adv_length_norm_stage", "loss")
+            )
             tu.assign_non_tensor(
                 batch_td,
                 calculate_entropy=calculate_entropy,
@@ -1175,6 +1244,19 @@ class RayPPOTrainer:
                 epochs=ppo_epochs,
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
+                adv_length_norm_enable=(
+                    bool(getattr(self.config.actor_rollout_ref.actor, "adv_length_norm_enable", False))
+                    and adv_length_stage == "loss"
+                ),
+                adv_length_norm_quantile=float(
+                    getattr(self.config.actor_rollout_ref.actor, "adv_length_norm_quantile", 0.95)
+                ),
+                seq_norm_adaptive_enable=bool(
+                    getattr(self.config.actor_rollout_ref.actor, "seq_norm_adaptive_enable", False)
+                ),
+                seq_norm_adaptive_quantile=float(
+                    getattr(self.config.actor_rollout_ref.actor, "seq_norm_adaptive_quantile", 0.95)
+                ),
             )
 
             actor_output = self.actor_rollout_wg.update_actor(batch_td)
@@ -1468,6 +1550,15 @@ class RayPPOTrainer:
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
+                            token_gap = is_metrics.get("rollout_corr/logprob_abs_diff")
+                            if token_gap is None:
+                                raise RuntimeError(
+                                    "token-level rollout correction did not emit "
+                                    "rollout_corr/logprob_abs_diff"
+                                )
+                            # Keep an exact cross-framework alias so this FSDP
+                            # metric can be overlaid directly with slime runs.
+                            metrics["train/train_rollout_logprob_abs_diff"] = token_gap
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
@@ -1483,6 +1574,8 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        batch = self._apply_driver_adv_length_norm(batch, metrics)
 
                     # update critic
                     if self.use_critic:

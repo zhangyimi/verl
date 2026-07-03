@@ -139,6 +139,13 @@ class FSDPEngine(BaseEngine):
         if self._qat_enabled:
             logger.info(f"QAT enabled: mode={self._qat_config.mode}, group_size={self._qat_config.group_size}")
 
+        router_replay = getattr(self.engine_config, "router_replay", None)
+        self._router_replay_mode = getattr(router_replay, "mode", "disabled")
+        if self._router_replay_mode not in {"disabled", "R3"}:
+            raise NotImplementedError(
+                f"FSDP router replay supports only disabled/R3, got {self._router_replay_mode!r}"
+            )
+
         if self.engine_config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
         else:
@@ -453,6 +460,9 @@ class FSDPEngine(BaseEngine):
                 "group_size": self._qat_config.group_size,
                 "ignore_patterns": list(self._qat_config.ignore_patterns),
                 "activation_observer": self._qat_config.activation_observer,
+                "activation_observer_update_interval": getattr(
+                    self._qat_config, "activation_observer_update_interval", 1
+                ),
             },
         )
         enable_qat_fuse(module)
@@ -514,6 +524,20 @@ class FSDPEngine(BaseEngine):
         # Apply QAT before FSDP wrapping (training only)
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
+
+        # The hook is used by the opt-in natural-route diagnostic and by
+        # production FSDP R3.  It is idle outside an explicitly-scoped forward.
+        self._route_diag_capture = None
+        from verl.utils.route_diagnostics import route_diag_enabled
+
+        if route_diag_enabled() or self._router_replay_mode == "R3":
+            if self.ulysses_sequence_parallel_size != 1:
+                raise NotImplementedError("FSDP route diagnostics/R3 currently require ulysses_sequence_parallel_size=1")
+            from verl.utils.route_diagnostics import FSDPRouteCapture
+
+            self._route_diag_capture = FSDPRouteCapture(
+                module, topk=int(os.environ.get("VERL_ROUTE_DIAG_TOPK", "8"))
+            )
 
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()
@@ -582,6 +606,65 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
+        # Independent whole-minibatch length quantiles across the DP group.
+        # Reset both channels first so a skipped/forward-only pass cannot leak
+        # a stale reference into a later actor update.
+        from verl.trainer.ppo.core_algos import (
+            compute_length_quantile_refs,
+            set_adv_length_ref_global,
+            set_seq_norm_p95_global,
+        )
+
+        set_adv_length_ref_global(None)
+        set_seq_norm_p95_global(None)
+        adv_length_norm_enabled = bool(
+            tu.get_non_tensor_data(data, key="adv_length_norm_enable", default=False)
+        )
+        seq_norm_enabled = bool(
+            tu.get_non_tensor_data(data, key="seq_norm_adaptive_enable", default=False)
+        )
+        adv_ref_override = tu.get_non_tensor_data(data, key="adv_length_norm_ref_global", default=None)
+        seq_ref_override = tu.get_non_tensor_data(data, key="seq_norm_ref_global", default=None)
+        if adv_length_norm_enabled and adv_ref_override is not None:
+            set_adv_length_ref_global(float(adv_ref_override))
+        if seq_norm_enabled and seq_ref_override is not None:
+            set_seq_norm_p95_global(float(seq_ref_override))
+        need_adv_ref = adv_length_norm_enabled and adv_ref_override is None
+        need_seq_ref = seq_norm_enabled and seq_ref_override is None
+        if (
+            (not forward_only)
+            and torch.distributed.is_initialized()
+            and ("response_mask" in data.keys())
+            and (need_adv_ref or need_seq_ref)
+        ):
+            _rm = data["response_mask"]
+            _len = _rm.sum(dim=-1).float()
+            _loc = _len[_rm.any(dim=-1)].detach().cpu().tolist()
+            _grp = self.get_data_parallel_group()
+            _ws = torch.distributed.get_world_size(group=_grp)
+            if _ws > 1:
+                _gath = [None] * _ws
+                torch.distributed.all_gather_object(_gath, _loc, group=_grp)
+                _all = [v for sub in _gath if sub for v in sub]
+            else:
+                _all = _loc
+            if len(_all) > 0:
+                _adv_ref, _seq_ref = compute_length_quantile_refs(
+                    torch.tensor(_all, dtype=torch.float32),
+                    adv_enabled=need_adv_ref,
+                    adv_quantile=float(
+                        tu.get_non_tensor_data(data, key="adv_length_norm_quantile", default=0.95)
+                    ),
+                    seq_enabled=need_seq_ref,
+                    seq_quantile=float(
+                        tu.get_non_tensor_data(data, key="seq_norm_adaptive_quantile", default=0.95)
+                    ),
+                )
+                if need_adv_ref:
+                    set_adv_length_ref_global(_adv_ref)
+                if need_seq_ref:
+                    set_seq_norm_p95_global(_seq_ref)
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
@@ -591,11 +674,26 @@ class FSDPEngine(BaseEngine):
         ctx = torch.no_grad() if forward_only else nullcontext()
 
         for micro_batch in micro_batches:
-            with ctx:
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+            try:
+                with ctx:
+                    loss, meta_info = self.forward_step(
+                        micro_batch, loss_function=loss_function, forward_only=forward_only
+                    )
 
-                if not forward_only:
-                    loss.backward()
+                    if not forward_only:
+                        loss.backward()
+
+                # In R3 training the hook must remain active through backward:
+                # gradient checkpointing re-executes MoE gates there.  End the
+                # replay only after recomputation has completed.
+                route_capture = getattr(self, "_route_diag_capture", None)
+                if route_capture is not None and route_capture.active:
+                    route_capture.end_replay()
+            except Exception:
+                route_capture = getattr(self, "_route_diag_capture", None)
+                if route_capture is not None and route_capture.active:
+                    route_capture.abort()
+                raise
 
             output_lst.append(meta_info)
 
@@ -640,9 +738,13 @@ class FSDPEngine(BaseEngine):
             self.optimizer.step()
 
         if self._qat_enabled:
-            from verl.utils.qat.core import invalidate_all_scales
+            from verl.utils.qat.core import invalidate_all_scales, set_qat_observer_train_step
 
             invalidate_all_scales(self.module)
+            # PERF (W4A4): advance observer step so the activation amax update is gated
+            # to every N optimizer steps instead of recomputed on every forward.
+            self._qat_observer_step = getattr(self, "_qat_observer_step", 0) + 1
+            set_qat_observer_train_step(self.module, self._qat_observer_step)
 
         return grad_norm.item()
 
@@ -762,6 +864,25 @@ class FSDPEngine(BaseEngine):
                 sync_qat_input_amax(self.module)
 
             params = self.module.state_dict()
+
+            if self._qat_enabled:
+                # input_global_scale is persistent=False (excluded from the state_dict that did
+                # 36864 cross-node collectives). Re-inject via LOCAL reads (replicated + synced by
+                # sync_qat_input_amax above) keyed by the pre-FSDP clean name, so convert_weight_keys
+                # transforms it identically to its weight and the quantizer matches it. No collective.
+                from verl.utils.qat.linear import QATLinear as _QATLin
+
+                _scales = {}
+                for _m in self.module.modules():
+                    if (
+                        isinstance(_m, _QATLin)
+                        and getattr(_m, "_qat_clean_name", None)
+                        and hasattr(_m, "input_global_scale")
+                    ):
+                        _scales[f"{_m._qat_clean_name}.input_global_scale"] = _m.input_global_scale.detach()
+                # PREPEND: the streaming quantizer collects input_global_scale as it iterates and
+                # uses it at each layer's flush, so scales MUST appear before that layer's weights.
+                params = {**_scales, **params}
 
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
@@ -1116,11 +1237,50 @@ class FSDPEngineWithLMHead(FSDPEngine):
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
+        route_capture = getattr(self, "_route_diag_capture", None)
+        from verl.utils.route_diagnostics import route_diag_enabled
+
+        replay_requested = bool(
+            tu.get_non_tensor_data(micro_batch, key="enable_routing_replay", default=False)
+        )
+        if replay_requested and self._router_replay_mode != "R3":
+            raise RuntimeError(
+                "FSDP routing replay was requested by the actor worker, but "
+                f"engine router_replay.mode={self._router_replay_mode!r}"
+            )
+        production_r3 = replay_requested and self._router_replay_mode == "R3"
+        diagnostic_capture = forward_only and route_diag_enabled()
+        capture_routes = route_capture is not None and (production_r3 or diagnostic_capture)
+        if capture_routes:
+            diagnostic_force = bool(tu.get_non_tensor_data(
+                micro_batch, key="route_diag_force_rollout_routes", default=False
+            ))
+            force_rollout_routes = production_r3 or diagnostic_force
+            route_capture.begin(
+                micro_batch,
+                force_rollout_routes=force_rollout_routes,
+                collect_metrics=diagnostic_capture and not diagnostic_force,
+                allow_reentry=not forward_only,
+                require_complete_routes=production_r3,
+                require_checkpoint_reentry=(
+                    production_r3 and not forward_only and self.model_config.enable_gradient_checkpointing
+                ),
+            )
+
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
+            try:
+                raw_output = self.module(
+                    **model_inputs,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+            except Exception:
+                if capture_routes:
+                    route_capture.abort()
+                raise
+
+            # Forward-only inference has no checkpoint recomputation, so it can
+            # close the scope here.  Training closes it after loss.backward().
+            route_metrics = route_capture.finish(micro_batch) if capture_routes and forward_only else {}
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch
@@ -1134,6 +1294,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+
+            metrics.update(route_metrics)
 
             output = {
                 "model_output": model_output,

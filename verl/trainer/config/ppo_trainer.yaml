@@ -129,6 +129,11 @@ trainer:
   # Experiment name for run identification in tracking tools
   experiment_name: gsm8k
 
+  # Optional explicit W&B run identity/resume policy. Null preserves the
+  # logger's existing environment/default behavior for all other recipes.
+  wandb_run_id: null
+  wandb_resume: null
+
   # Logging backends to use: "console", "wandb", etc.
   logger: ["console", "wandb"]
 

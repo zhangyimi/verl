@@ -239,6 +239,54 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
+        # Compute adaptive length references once from the entire actor update
+        # before PPO mini/micro-batching.  Each worker owns one DP partition;
+        # all_gather_object reconstructs the exact whole-update population.
+        adv_length_norm_enabled = bool(
+            tu.get_non_tensor_data(data, key="adv_length_norm_enable", default=False)
+        )
+        seq_norm_enabled = bool(
+            tu.get_non_tensor_data(data, key="seq_norm_adaptive_enable", default=False)
+        )
+        if (adv_length_norm_enabled or seq_norm_enabled) and "response_mask" in data.keys():
+            from verl.trainer.ppo.core_algos import (
+                compute_length_quantile_refs,
+                validate_global_length_population,
+            )
+
+            response_mask = data["response_mask"]
+            local_lengths = response_mask.sum(dim=-1).float()
+            local_active = response_mask.any(dim=-1)
+            local_payload = {
+                "total": int(response_mask.shape[0]),
+                "active": int(local_active.sum().item()),
+                "lengths": local_lengths[local_active].detach().cpu().tolist(),
+            }
+            gathered = [None] * self.engine.get_data_parallel_size()
+            torch.distributed.all_gather_object(
+                gathered, local_payload, group=self.engine.get_data_parallel_group()
+            )
+            global_lengths = validate_global_length_population(
+                gathered,
+                batch_size_per_dp=batch_size_per_dp,
+                dp_size=self.engine.get_data_parallel_size(),
+            )
+            adv_ref, seq_ref = compute_length_quantile_refs(
+                torch.tensor(global_lengths, dtype=torch.float32),
+                adv_enabled=adv_length_norm_enabled,
+                adv_quantile=float(
+                    tu.get_non_tensor_data(data, key="adv_length_norm_quantile", default=0.95)
+                ),
+                seq_enabled=seq_norm_enabled,
+                seq_quantile=float(
+                    tu.get_non_tensor_data(data, key="seq_norm_adaptive_quantile", default=0.95)
+                ),
+            )
+            if adv_length_norm_enabled:
+                tu.assign_non_tensor(data, adv_length_norm_ref_global=adv_ref)
+            if seq_norm_enabled:
+                tu.assign_non_tensor(data, seq_norm_ref_global=seq_ref)
+
         if mini_batch_size is None:
             assert batch_size_per_dp % num_mini_batch == 0, f"Got {batch_size_per_dp=} and {num_mini_batch=}"
             mini_batch_size_per_gpu = batch_size_per_dp // num_mini_batch
@@ -448,9 +496,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             tool_config = None
 
-        self.enable_routing_replay = (
-            self.config.actor.strategy == "megatron" and self.config.actor.megatron.router_replay.mode != "disabled"
-        )
+        actor_strategy = self.config.actor.strategy
+        if actor_strategy == "megatron":
+            actor_engine_config = self.config.actor.megatron
+        elif actor_strategy in {"fsdp", "fsdp2"}:
+            actor_engine_config = self.config.actor.fsdp_config
+        else:
+            actor_engine_config = {}
+        router_replay_config = actor_engine_config.get("router_replay", {})
+        self.enable_routing_replay = router_replay_config.get("mode", "disabled") != "disabled"
 
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)

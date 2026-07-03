@@ -155,6 +155,130 @@ class ActorConfig(BaseConfig):
     clip_ratio_c: float = 3.0
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
+    pg_mask_enable: bool = False
+    pg_mask_delta_min: Optional[float] = None
+    pg_mask_delta_max: Optional[float] = None
+    pg_mask_bad_weight: float = 0.0
+
+    # W4A4/W4A8 periodic activation-amax re-calibration (0 = off). Every N policy updates the
+    # Megatron actor re-runs modelopt max-calibration to refresh the otherwise-frozen
+    # input_quantizer amax so the FP4 activation scale tracks the drifting activation range.
+    recalib_every: int = 0
+
+    vllm_align_enable: bool = False
+    vllm_align_coef: float = 0.0
+    vllm_align_loss_type: str = "k3"
+    vllm_align_delta_min: Optional[float] = None
+    vllm_align_delta_max: Optional[float] = None
+    vllm_align_abs_delta_min: Optional[float] = None
+    vllm_align_abs_delta_max: Optional[float] = None
+    vllm_align_adv_min: Optional[float] = None
+    vllm_align_adv_max: Optional[float] = None
+    vllm_align_segment_pos_enable: bool = False
+    vllm_align_huber_beta: float = 1.0
+    vllm_align_normalize_by_window: bool = False
+    vllm_align_min_window_fraction: float = 0.0
+    vllm_align_loss_cap: Optional[float] = None
+    vllm_align_hard_enable: bool = False
+    vllm_align_hard_coef: float = 0.0
+    vllm_align_hard_loss_type: str = "huber"
+    vllm_align_hard_delta_min: Optional[float] = None
+    vllm_align_hard_delta_max: Optional[float] = None
+    vllm_align_hard_abs_delta_min: Optional[float] = None
+    vllm_align_hard_abs_delta_max: Optional[float] = None
+    vllm_align_hard_huber_beta: float = 1.0
+    vllm_align_hard_normalize_by_window: bool = False
+    vllm_align_hard_loss_cap: Optional[float] = None
+
+    delta_mean_guard_enable: bool = False
+    delta_mean_guard_coef: float = 0.0
+    delta_mean_guard_target: float = -0.01
+    delta_mean_guard_mode: str = "token"
+    delta_mean_guard_delta_min: Optional[float] = None
+    delta_mean_guard_delta_max: Optional[float] = None
+    delta_mean_guard_adv_min: Optional[float] = None
+    delta_mean_guard_adv_max: Optional[float] = None
+    delta_mean_guard_loss_cap: Optional[float] = None
+
+    seq_norm_adaptive_enable: bool = False
+    seq_norm_adaptive_quantile: float = 0.95
+    seq_norm_adaptive_ema_beta: float = 0.9
+    seq_norm_adaptive_quantile_ema: Optional[float] = None
+    seq_norm_adaptive_threshold_1: float = 4096.0
+    seq_norm_adaptive_threshold_2: float = 8192.0
+    seq_norm_adaptive_threshold_3: float = 12288.0
+    seq_norm_adaptive_denom_1: float = 8192.0
+    seq_norm_adaptive_denom_2: float = 12288.0
+    seq_norm_adaptive_denom_3: float = 16384.0
+    seq_norm_adaptive_denom_4: float = 20480.0
+    seq_norm_adaptive_tail_denom: float = 20480.0
+    seq_norm_adaptive_tail_power: float = 0.0
+
+    local_segment_align_enable: bool = False
+    local_segment_align_coef: float = 0.0
+    local_segment_align_target: float = -0.03
+    local_segment_align_size: int = 128
+    local_segment_align_loss_cap: Optional[float] = None
+    local_segment_align_length_gate_enable: bool = False
+    local_segment_align_length_gate_quantile: float = 0.95
+    local_segment_align_length_gate_min: float = 8192.0
+    local_segment_align_length_gate_mean_min: float = 7000.0
+    local_segment_align_length_gate_clip_ratio_min: float = 0.02
+    local_segment_align_kl_gate_enable: bool = False
+    local_segment_align_kl_gate_start: float = 0.01
+    local_segment_align_kl_gate_full: float = 0.02
+    local_segment_align_kl_gate_min_factor: float = 0.0
+    local_segment_align_kl_gate_max_factor: float = 1.0
+    local_segment_align_adaptive_tail_enable: bool = False
+    local_segment_align_adaptive_tail_offset: float = 4096.0
+    local_segment_align_adaptive_tail_min_start: float = 8192.0
+    local_segment_align_adaptive_tail_max_start: float = 14336.0
+    local_segment_align_adaptive_tail_width: float = 4096.0
+    local_segment_align_adaptive_tail_mass_min: float = 0.02
+    local_segment_align_adaptive_tail_clip_gate_enable: bool = False
+    local_segment_align_adaptive_tail_clip_ratio_min: float = 0.02
+    local_segment_align_adaptive_tail_uniform_weight: bool = False
+
+    seq_mismatch_gate_enable: bool = False
+    seq_mismatch_gate_delta_min: Optional[float] = None
+    seq_mismatch_gate_delta_max: Optional[float] = None
+    seq_mismatch_gate_neg_prox_delta_max: Optional[float] = None
+    seq_mismatch_gate_neg_adv_max: float = 0.0
+    seq_mismatch_gate_bad_weight: float = 0.3
+
+    seq_tbpo_enable: bool = False
+    seq_tbpo_clip_ratio_high: float = 0.001
+    seq_tbpo_neg_clip_ratio_low: float = 0.001
+    seq_tbpo_neg_clip_ratio_high: float = 0.001
+    seq_tbpo_tis_imp_ratio_cap: float = 2.0
+
+    adv_length_norm_enable: bool = False
+    # disabled: no length shaping; loss: legacy per-loss shaping;
+    # driver_group_recenter: shape GRPO sequence advantages once on the driver
+    # and restore each uid group's zero mean before dispatch.
+    adv_length_norm_stage: str = "loss"
+    adv_length_norm_mode: str = "neg_only"
+    adv_length_norm_ref_len: int = 4096
+    # Whole-update response-length quantile used as the adaptive advantage
+    # reference.  This is intentionally independent from seq-norm's quantile.
+    adv_length_norm_quantile: float = 0.95
+    adv_length_norm_alpha: float = 0.5
+    adv_length_norm_min_scale: float = 0.5
+    adv_length_norm_max_scale: float = 1.0
+
+    seg_gate_enable: bool = False
+    seg_gate_size: int = 128
+    seg_gate_neg_delta_threshold: float = -0.5
+    seg_gate_neg_adv_max: float = 0.0
+    seg_gate_neg_weight: float = 0.3
+    seg_gate_severe_delta_threshold: Optional[float] = -1.5
+    seg_gate_bad_delta_threshold: float = -6.0
+    seg_gate_bad_fraction_threshold: Optional[float] = 0.02
+    seg_gate_severe_weight: float = 0.1
+    seg_gate_pos_enable: bool = False
+    seg_gate_pos_delta_threshold: float = -0.5
+    seg_gate_pos_adv_min: float = 0.0
+
     entropy_coeff: float = 0
     tau_pos: float = 1.0
     tau_neg: float = 1.05
@@ -208,6 +332,13 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        valid_adv_length_stages = {"disabled", "loss", "driver_group_recenter"}
+        if self.adv_length_norm_stage not in valid_adv_length_stages:
+            raise ValueError(
+                f"Invalid adv_length_norm_stage: {self.adv_length_norm_stage}; "
+                f"expected one of {sorted(valid_adv_length_stages)}"
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

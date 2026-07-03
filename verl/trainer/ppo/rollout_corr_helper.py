@@ -892,6 +892,12 @@ def compute_offpolicy_metrics(
         # More stable for small KL values using: E[exp(log_ratio) - log_ratio - 1]
         # Formula: KL ≈ E[r - log(r) - 1] where r = π_training/π_rollout
         log_ratio = old_log_prob - rollout_log_prob
+        # Token-level absolute log-probability gap.  Unlike the sequence-level
+        # log-PPL difference below, this cannot hide positive/negative token
+        # errors through within-sequence cancellation.
+        metrics["logprob_abs_diff"] = (
+            verl_F.masked_mean(log_ratio.abs(), response_mask).detach().item()
+        )
         k3_kl_matrix = torch.exp(log_ratio) - log_ratio - 1
         metrics["k3_kl"] = verl_F.masked_mean(k3_kl_matrix, response_mask).detach().item()
 

@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
@@ -1065,12 +1066,26 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
-        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
         if loss_agg_mode == "seq-mean-token-sum-norm":
             if loss_scale_factor is None:
                 horizon = loss_mask.shape[-1]
                 loss_scale_factor = horizon
-            loss /= loss_scale_factor
+            if torch.is_tensor(loss_scale_factor):
+                seq_scale = loss_scale_factor.to(device=seq_losses.device, dtype=seq_losses.dtype)
+                # Guard against the adaptive tail-denom inverting into a length AMPLIFIER:
+                # a sequence longer than its denom (e.g. tail_denom < actual response length)
+                # gets seq_losses/denom weighted >1 "unit" -> positive-feedback length runaway,
+                # the exact failure this length-norm is meant to prevent. Floor each per-seq
+                # denom at its own token count so every sequence contributes <=1 unit (a
+                # too-long sequence is divided by its own length -> neutral, never amplified).
+                seq_token_count = loss_mask.sum(dim=-1).to(dtype=seq_scale.dtype)
+                seq_scale = torch.maximum(seq_scale, seq_token_count)
+                seq_losses = seq_losses / seq_scale.clamp_min(1e-8)
+                loss_scale_factor = None
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            if loss_scale_factor is not None:
+                loss /= loss_scale_factor
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean
@@ -1084,6 +1099,1073 @@ def agg_loss(
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
     return loss
+
+
+def _masked_mean_or_zero(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_f = mask.to(dtype=values.dtype)
+    denom = mask_f.sum()
+    if denom.detach().item() <= 0:
+        return values.new_zeros(())
+    return (values * mask_f).sum() / denom.clamp_min(1.0)
+
+
+def _masked_sum_or_zero(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_f = mask.to(dtype=values.dtype)
+    if mask_f.sum().detach().item() <= 0:
+        return values.new_zeros(())
+    return (values * mask_f).sum()
+
+
+def _global_sum_scalar(value: torch.Tensor, dp_group=None) -> torch.Tensor:
+    value = value.clone()
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    return value
+
+
+def _align_token_objective(raw_delta: torch.Tensor, loss_type: str, beta: float) -> torch.Tensor:
+    delta = torch.clamp(raw_delta, min=-20.0, max=20.0)
+    if loss_type == "huber":
+        return F.smooth_l1_loss(delta, torch.zeros_like(delta), reduction="none", beta=beta)
+    if loss_type == "mse":
+        return torch.square(delta)
+    if loss_type == "abs":
+        return torch.abs(delta)
+    token_obj = torch.exp(delta) - delta - 1.0
+    return torch.clamp(token_obj, min=-10.0, max=10.0)
+
+
+def _delta_window(
+    response_mask: torch.Tensor,
+    raw_delta: torch.Tensor,
+    delta_min: float | None,
+    delta_max: float | None,
+    abs_delta_min: float | None,
+    abs_delta_max: float | None,
+) -> torch.Tensor:
+    window = response_mask.clone()
+    if delta_min is not None:
+        window = window & (raw_delta >= float(delta_min))
+    if delta_max is not None:
+        window = window & (raw_delta <= float(delta_max))
+    abs_delta = torch.abs(raw_delta)
+    if abs_delta_min is not None:
+        window = window & (abs_delta >= float(abs_delta_min))
+    if abs_delta_max is not None:
+        window = window & (abs_delta <= float(abs_delta_max))
+    return window
+
+
+def _segment_mismatch_gate(
+    response_mask: torch.Tensor,
+    raw_delta: torch.Tensor,
+    advantages: torch.Tensor,
+    *,
+    segment_size: int,
+    neg_delta_threshold: float,
+    neg_adv_max: float,
+    neg_weight: float,
+    severe_delta_threshold: float | None,
+    bad_delta_threshold: float,
+    bad_fraction_threshold: float | None,
+    severe_weight: float,
+    pos_delta_threshold: float,
+    pos_adv_min: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    segment_size = max(int(segment_size), 1)
+    neg_weight = min(max(float(neg_weight), 0.0), 1.0)
+    severe_weight = min(max(float(severe_weight), 0.0), 1.0)
+
+    response_mask_f = response_mask.to(dtype=raw_delta.dtype)
+    pg_weight = torch.ones_like(raw_delta)
+    neg_segment_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    severe_segment_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    pos_segment_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    neg_segment_count = raw_delta.new_zeros(())
+    severe_segment_count = raw_delta.new_zeros(())
+    pos_segment_count = raw_delta.new_zeros(())
+
+    seq_len = raw_delta.shape[-1]
+    detached_delta = raw_delta.detach()
+    detached_adv = advantages.detach()
+
+    for start in range(0, seq_len, segment_size):
+        end = min(start + segment_size, seq_len)
+        seg_mask = response_mask[:, start:end]
+        seg_mask_f = response_mask_f[:, start:end]
+        token_count = seg_mask_f.sum(dim=-1)
+        valid_seg = token_count > 0
+        denom = token_count.clamp_min(1.0)
+
+        seg_delta = (detached_delta[:, start:end] * seg_mask_f).sum(dim=-1) / denom
+        seg_adv = (detached_adv[:, start:end] * seg_mask_f).sum(dim=-1) / denom
+        seg_bad_fraction = (((detached_delta[:, start:end] < bad_delta_threshold) & seg_mask).float()).sum(
+            dim=-1
+        ) / denom
+
+        neg_segment = valid_seg & (seg_delta < neg_delta_threshold) & (seg_adv < neg_adv_max)
+        severe_segment = torch.zeros_like(neg_segment)
+        if severe_delta_threshold is not None:
+            severe_segment = severe_segment | (seg_delta < float(severe_delta_threshold))
+        if bad_fraction_threshold is not None:
+            severe_segment = severe_segment | (seg_bad_fraction > float(bad_fraction_threshold))
+        severe_segment = valid_seg & severe_segment & (seg_adv < neg_adv_max)
+        pos_segment = valid_seg & (seg_delta < pos_delta_threshold) & (seg_adv > pos_adv_min)
+
+        neg_segment_count = neg_segment_count + neg_segment.to(dtype=raw_delta.dtype).sum()
+        severe_segment_count = severe_segment_count + severe_segment.to(dtype=raw_delta.dtype).sum()
+        pos_segment_count = pos_segment_count + pos_segment.to(dtype=raw_delta.dtype).sum()
+
+        seg_weight = torch.ones_like(seg_delta)
+        seg_weight = torch.where(neg_segment, torch.full_like(seg_weight, neg_weight), seg_weight)
+        seg_weight = torch.where(severe_segment, torch.full_like(seg_weight, severe_weight), seg_weight)
+        pg_weight[:, start:end] = pg_weight[:, start:end] * torch.where(
+            seg_mask,
+            seg_weight.unsqueeze(-1),
+            torch.ones_like(pg_weight[:, start:end]),
+        )
+        neg_segment_mask[:, start:end] = neg_segment.unsqueeze(-1) & seg_mask
+        severe_segment_mask[:, start:end] = severe_segment.unsqueeze(-1) & seg_mask
+        pos_segment_mask[:, start:end] = pos_segment.unsqueeze(-1) & seg_mask
+
+    return (
+        pg_weight,
+        neg_segment_mask,
+        severe_segment_mask,
+        pos_segment_mask,
+        neg_segment_count,
+        severe_segment_count,
+        pos_segment_count,
+    )
+
+
+# Per-step GLOBAL response-length references, set by the actor worker once
+# before the micro-batch loop.  Advantage P70 and sequence-normalization P95
+# are separate controls; sharing one global P95 was the original bug.
+_SEQ_NORM_P95_GLOBAL = None
+_ADV_LENGTH_REF_GLOBAL = None
+
+
+def set_seq_norm_p95_global(value):
+    global _SEQ_NORM_P95_GLOBAL
+    _SEQ_NORM_P95_GLOBAL = value
+
+
+def set_adv_length_ref_global(value):
+    global _ADV_LENGTH_REF_GLOBAL
+    _ADV_LENGTH_REF_GLOBAL = value
+
+
+def compute_length_quantile_refs(
+    response_lengths: torch.Tensor,
+    *,
+    adv_enabled: bool,
+    adv_quantile: float,
+    seq_enabled: bool,
+    seq_quantile: float,
+) -> tuple[float | None, float | None]:
+    """Compute independent advantage/seq-norm references from one global set.
+
+    ``response_lengths`` must already contain all active sequences in the DP
+    update.  Keeping this helper pure makes global-partition invariance easy to
+    test without initializing torch.distributed.
+    """
+
+    lengths = response_lengths.detach().float().reshape(-1)
+    lengths = lengths[torch.isfinite(lengths) & lengths.gt(0)]
+    if lengths.numel() == 0:
+        return None, None
+
+    def quantile(q: float) -> float:
+        q = min(max(float(q), 1e-6), 1.0)
+        return float(torch.quantile(lengths, q).item())
+
+    adv_ref = quantile(adv_quantile) if adv_enabled else None
+    seq_ref = quantile(seq_quantile) if seq_enabled else None
+    return adv_ref, seq_ref
+
+
+def validate_global_length_population(
+    rank_payloads: list[dict], *, batch_size_per_dp: int, dp_size: int
+) -> list[float]:
+    """Validate and flatten one whole actor-update response population.
+
+    R3/ADV-P70 expects every dispatched sample to have a non-empty response.
+    Failing here prevents a silently biased percentile when a rank drops or
+    omits samples before PPO mini/micro-batch splitting.
+    """
+
+    rank_counts = [
+        {
+            "rank": rank,
+            "total": int(payload.get("total", -1)),
+            "active": int(payload.get("active", -1)),
+            "length_count": len(payload.get("lengths", [])),
+        }
+        for rank, payload in enumerate(rank_payloads)
+    ]
+    expected_total = int(batch_size_per_dp) * int(dp_size)
+    actual_total = sum(item["total"] for item in rank_counts)
+    actual_active = sum(item["active"] for item in rank_counts)
+    valid = (
+        len(rank_payloads) == int(dp_size)
+        and actual_total == expected_total
+        and actual_active == actual_total
+        and all(
+            item["total"] == int(batch_size_per_dp)
+            and item["active"] == item["total"]
+            and item["length_count"] == item["active"]
+            for item in rank_counts
+        )
+    )
+    if not valid:
+        raise RuntimeError(
+            "adaptive length population invariant failed: "
+            f"expected_total={expected_total}, actual_total={actual_total}, "
+            f"actual_active={actual_active}, dp_size={dp_size}, rank_counts={rank_counts}"
+        )
+    return [float(value) for payload in rank_payloads for value in payload["lengths"]]
+
+
+@torch.no_grad()
+def apply_group_recentered_adv_length_norm(
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    uids: Any,
+    *,
+    quantile: float,
+    alpha: float,
+    min_scale: float,
+    max_scale: float,
+    expected_group_size: int,
+    mode: str = "neg_only",
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Apply global length damping while preserving GRPO's per-group zero mean.
+
+    GRPO produces one scalar advantage per response and centers those scalars
+    within each prompt/uid group.  Scaling only negative responses inside the
+    policy loss breaks that invariant and creates a positive group bias.  This
+    function runs once on the global driver batch: compute P(q), damp long
+    negative sequence advantages, then re-center every uid group before actor
+    dispatch.  Returns are intentionally outside this function and unchanged.
+    """
+
+    if advantages.ndim != 2 or response_mask.shape != advantages.shape:
+        raise ValueError(
+            "driver_group_recenter requires advantages/response_mask with identical [batch,response] shape; "
+            f"got advantages={tuple(advantages.shape)}, mask={tuple(response_mask.shape)}"
+        )
+    if mode != "neg_only":
+        raise ValueError(f"driver_group_recenter supports only neg_only mode, got {mode!r}")
+    if not (0.0 < float(quantile) <= 1.0):
+        raise ValueError(f"advantage length quantile must be in (0,1], got {quantile}")
+    if not np.isfinite(alpha) or float(alpha) < 0.0:
+        raise ValueError(f"advantage length alpha must be finite and non-negative, got {alpha}")
+    if not (0.0 <= float(min_scale) <= float(max_scale) <= 1.0):
+        raise ValueError(f"advantage scales must satisfy 0 <= min <= max <= 1, got {min_scale}, {max_scale}")
+    if int(expected_group_size) < 2:
+        raise ValueError(f"GRPO driver_group_recenter requires group size >=2, got {expected_group_size}")
+
+    mask = response_mask.bool()
+    batch_size = advantages.shape[0]
+    uid_values = np.asarray(uids, dtype=object).reshape(-1).tolist()
+    if len(uid_values) != batch_size:
+        raise ValueError(f"uid count {len(uid_values)} does not match advantage batch {batch_size}")
+    invalid_uid_indices = []
+    for index, uid in enumerate(uid_values):
+        invalid = uid is None or (isinstance(uid, str) and not uid.strip())
+        if isinstance(uid, (float, np.floating)) and not np.isfinite(uid):
+            invalid = True
+        try:
+            hash(uid)
+        except TypeError:
+            invalid = True
+        if invalid:
+            invalid_uid_indices.append(index)
+    if invalid_uid_indices:
+        raise ValueError(f"missing/invalid uid values at batch indices {invalid_uid_indices}")
+
+    response_lengths = mask.sum(dim=-1)
+    empty_indices = torch.nonzero(response_lengths.eq(0), as_tuple=False).reshape(-1).cpu().tolist()
+    if empty_indices:
+        raise ValueError(f"driver_group_recenter found empty responses at batch indices {empty_indices}")
+    if not torch.isfinite(advantages[mask]).all():
+        raise ValueError("driver_group_recenter received non-finite active advantages")
+
+    lengths_float = response_lengths.float()
+    seq_advantages = (advantages.float() * mask).sum(dim=-1) / lengths_float
+    deviations = (advantages.float() - seq_advantages.unsqueeze(-1)).abs().masked_fill(~mask, 0.0)
+    tolerance = 1e-5 + 1e-4 * seq_advantages.abs()
+    nonconstant = torch.nonzero(deviations.amax(dim=-1) > tolerance, as_tuple=False).reshape(-1)
+    if nonconstant.numel() > 0:
+        raise ValueError(
+            "driver_group_recenter requires one constant GRPO advantage per response; "
+            f"nonconstant batch indices={nonconstant.cpu().tolist()}"
+        )
+
+    groups: dict[Any, list[int]] = defaultdict(list)
+    for index, uid in enumerate(uid_values):
+        groups[uid].append(index)
+    group_sizes = [len(indices) for indices in groups.values()]
+    if not group_sizes or len(set(group_sizes)) != 1 or group_sizes[0] != int(expected_group_size):
+        raise ValueError(
+            "driver_group_recenter requires complete, equally-sized uid groups; "
+            f"expected_group_size={expected_group_size}, observed_group_sizes={group_sizes}"
+        )
+
+    ref_len = float(torch.quantile(lengths_float, float(quantile)).item())
+    if not np.isfinite(ref_len) or ref_len <= 0.0:
+        raise ValueError(f"invalid global response-length reference: {ref_len}")
+    length_scale = torch.pow(torch.clamp(ref_len / lengths_float, max=1.0), float(alpha))
+    length_scale = torch.clamp(length_scale, min=float(min_scale), max=float(max_scale))
+    negative = seq_advantages < 0
+    effective_scale = torch.where(negative, length_scale, torch.ones_like(length_scale))
+    scaled_seq_advantages = seq_advantages * effective_scale
+
+    recentered = scaled_seq_advantages.clone()
+    pre_means = []
+    post_means = []
+    for indices in groups.values():
+        index = torch.tensor(indices, device=advantages.device, dtype=torch.long)
+        pre_mean = scaled_seq_advantages[index].mean()
+        recentered[index] = scaled_seq_advantages[index] - pre_mean
+        post_mean = recentered[index].mean()
+        pre_means.append(pre_mean)
+        post_means.append(post_mean)
+
+    pre_means_tensor = torch.stack(pre_means)
+    post_means_tensor = torch.stack(post_means)
+    if not torch.isfinite(recentered).all() or float(post_means_tensor.abs().max().item()) > 1e-5:
+        raise RuntimeError(
+            "driver_group_recenter failed to produce finite zero-mean groups; "
+            f"max_abs_group_mean={float(post_means_tensor.abs().max().item())}"
+        )
+
+    output = torch.where(mask, recentered.to(advantages.dtype).unsqueeze(-1), advantages)
+    actually_scaled = negative & effective_scale.lt(0.999)
+    metrics = {
+        "actor/adv_length_norm_ref_len": ref_len,
+        "actor/adv_length_norm_quantile": float(quantile),
+        "actor/adv_length_norm_scale_mean": float(effective_scale.mean().item()),
+        "actor/adv_length_norm_scaled_seq_fraction": float(actually_scaled.float().mean().item()),
+        "actor/adv_length_norm_group_mean_abs_pre": float(pre_means_tensor.abs().mean().item()),
+        "actor/adv_length_norm_group_mean_abs_post": float(post_means_tensor.abs().mean().item()),
+        "actor/adv_length_norm_group_count": float(len(groups)),
+        "actor/adv_length_norm_group_size": float(group_sizes[0]),
+    }
+    return output, metrics
+
+
+def _apply_gap_guard_policy_loss(
+    *,
+    config: ActorConfig,
+    policy_loss_fn,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str,
+    rollout_is_weights: torch.Tensor | None,
+    rollout_log_prob: torch.Tensor | None,
+    dp_group=None,
+) -> tuple[torch.Tensor, dict, torch.Tensor | None]:
+    pg_advantages = advantages
+    pg_response_mask = response_mask
+    raw_delta = None
+    seg_gate_pos = None
+    stats = {}
+
+    if rollout_log_prob is not None:
+        rollout_log_prob = rollout_log_prob.detach()
+        raw_delta = log_prob - rollout_log_prob
+
+    # Independent global references.  P70 for advantage scaling must not
+    # silently change seq-norm P95 (or vice versa).
+    seq_norm_p95 = None
+    adv_length_ref = None
+    adv_length_stage = str(getattr(config, "adv_length_norm_stage", "loss"))
+    if adv_length_stage not in {"disabled", "loss", "driver_group_recenter"}:
+        raise ValueError(f"invalid adv_length_norm_stage={adv_length_stage!r}")
+    _need_adv_ref = bool(getattr(config, "adv_length_norm_enable", False)) and adv_length_stage == "loss"
+    _need_seq_ref = loss_agg_mode == "seq-mean-token-sum-norm" and bool(
+        getattr(config, "seq_norm_adaptive_enable", False)
+    )
+    if _need_seq_ref:
+        if _SEQ_NORM_P95_GLOBAL is not None:
+            seq_norm_p95 = float(_SEQ_NORM_P95_GLOBAL)
+        else:
+            _p95_lengths = response_mask.to(dtype=log_prob.dtype).sum(dim=-1).clamp_min(1.0)
+            _p95_active = _p95_lengths[response_mask.any(dim=-1)]
+            if _p95_active.numel() > 0:
+                _p95_q = min(max(float(getattr(config, "seq_norm_adaptive_quantile", 0.95)), 1e-6), 1.0)
+                seq_norm_p95 = float(torch.quantile(_p95_active.detach().float(), _p95_q).item())
+
+    if _need_adv_ref:
+        if _ADV_LENGTH_REF_GLOBAL is not None:
+            adv_length_ref = float(_ADV_LENGTH_REF_GLOBAL)
+        else:
+            _adv_lengths = response_mask.to(dtype=log_prob.dtype).sum(dim=-1).clamp_min(1.0)
+            _adv_active = _adv_lengths[response_mask.any(dim=-1)]
+            if _adv_active.numel() > 0:
+                _adv_q = min(max(float(getattr(config, "adv_length_norm_quantile", 0.95)), 1e-6), 1.0)
+                adv_length_ref = float(torch.quantile(_adv_active.detach().float(), _adv_q).item())
+
+    if (
+        raw_delta is not None
+        and bool(getattr(config, "adv_length_norm_enable", False))
+        and adv_length_stage == "loss"
+    ):
+        response_lengths = response_mask.to(dtype=log_prob.dtype).sum(dim=-1).clamp_min(1.0)
+        # Follow the configured global/local batch quantile so the scale measures "how much
+        # longer than the CURRENT typical length", instead of a fixed 4096 that everyone overshoots
+        # late in training (which pins the neg-advantage scale at min_scale for all sequences).
+        if adv_length_ref is not None:
+            ref_len = max(float(adv_length_ref), 1.0)
+        else:
+            ref_len = max(float(getattr(config, "adv_length_norm_ref_len", 4096)), 1.0)
+        alpha = max(float(getattr(config, "adv_length_norm_alpha", 0.5)), 0.0)
+        min_scale = min(max(float(getattr(config, "adv_length_norm_min_scale", 0.5)), 0.0), 1.0)
+        max_scale = max(float(getattr(config, "adv_length_norm_max_scale", 1.0)), min_scale)
+        adv_scale = torch.pow(torch.clamp(ref_len / response_lengths, max=1.0), alpha)
+        adv_scale = torch.clamp(adv_scale, min=min_scale, max=max_scale)
+        mode = str(getattr(config, "adv_length_norm_mode", "neg_only")).strip().lower()
+        scale_mat = adv_scale.unsqueeze(-1)
+        if mode == "all":
+            pg_advantages = advantages * scale_mat
+        elif mode == "pos_only":
+            pg_advantages = torch.where(advantages > 0, advantages * scale_mat, advantages)
+        else:
+            pg_advantages = torch.where(advantages < 0, advantages * scale_mat, advantages)
+        seq_has_tokens = response_mask.any(dim=-1)
+        stats["actor/adv_length_norm_scale_mean"] = _masked_mean_or_zero(adv_scale.float(), seq_has_tokens).item()
+        stats["actor/adv_length_norm_scaled_seq_fraction"] = _masked_mean_or_zero(
+            (adv_scale < 0.999).float(), seq_has_tokens
+        ).item()
+        stats["actor/adv_length_norm_ref_len"] = float(ref_len)
+        stats["actor/adv_length_norm_quantile"] = float(
+            getattr(config, "adv_length_norm_quantile", 0.95)
+        )
+
+    if raw_delta is not None and bool(getattr(config, "pg_mask_enable", False)):
+        pg_mask_bad = torch.zeros_like(response_mask, dtype=torch.bool)
+        pg_delta_min = getattr(config, "pg_mask_delta_min", None)
+        pg_delta_max = getattr(config, "pg_mask_delta_max", None)
+        if pg_delta_min is not None:
+            pg_mask_bad = pg_mask_bad | (raw_delta.detach() < float(pg_delta_min))
+        if pg_delta_max is not None:
+            pg_mask_bad = pg_mask_bad | (raw_delta.detach() > float(pg_delta_max))
+        pg_mask_bad = pg_mask_bad & response_mask
+        if pg_delta_min is not None or pg_delta_max is not None:
+            bad_weight = min(max(float(getattr(config, "pg_mask_bad_weight", 0.0)), 0.0), 1.0)
+            pg_response_mask = response_mask.to(dtype=log_prob.dtype) * torch.where(
+                pg_mask_bad,
+                torch.full_like(log_prob, bad_weight),
+                torch.ones_like(log_prob),
+            )
+            stats["actor/pg_mask_bad_fraction"] = _masked_mean_or_zero(pg_mask_bad.float(), response_mask).item()
+            stats["actor/pg_mask_weight_mean"] = _masked_mean_or_zero(pg_response_mask.float(), response_mask).item()
+            stats["actor/pg_mask_bad_weight"] = bad_weight
+
+    seg_gate_enable = bool(getattr(config, "seg_gate_enable", False))
+    seg_gate_pos_enable = bool(getattr(config, "seg_gate_pos_enable", False)) or bool(
+        getattr(config, "vllm_align_segment_pos_enable", False)
+    )
+    if raw_delta is not None and (seg_gate_enable or seg_gate_pos_enable):
+        (
+            seg_weight,
+            seg_gate_neg,
+            seg_gate_severe,
+            seg_gate_pos,
+            seg_gate_neg_segment_count,
+            seg_gate_severe_segment_count,
+            seg_gate_pos_segment_count,
+        ) = _segment_mismatch_gate(
+            response_mask=response_mask,
+            raw_delta=raw_delta.detach(),
+            advantages=advantages,
+            segment_size=int(getattr(config, "seg_gate_size", 128)),
+            neg_delta_threshold=float(getattr(config, "seg_gate_neg_delta_threshold", -0.5)),
+            neg_adv_max=float(getattr(config, "seg_gate_neg_adv_max", 0.0)),
+            neg_weight=float(getattr(config, "seg_gate_neg_weight", 0.3)),
+            severe_delta_threshold=getattr(config, "seg_gate_severe_delta_threshold", -1.5),
+            bad_delta_threshold=float(getattr(config, "seg_gate_bad_delta_threshold", -6.0)),
+            bad_fraction_threshold=getattr(config, "seg_gate_bad_fraction_threshold", 0.02),
+            severe_weight=float(getattr(config, "seg_gate_severe_weight", 0.1)),
+            pos_delta_threshold=float(getattr(config, "seg_gate_pos_delta_threshold", -0.5)),
+            pos_adv_min=float(getattr(config, "seg_gate_pos_adv_min", 0.0)),
+        )
+        if seg_gate_enable:
+            pg_response_mask = pg_response_mask.to(dtype=log_prob.dtype) * seg_weight
+            stats["actor/seg_gate_weight_mean"] = _masked_mean_or_zero(seg_weight.float(), response_mask).item()
+            stats["actor/seg_gate_neg_fraction"] = _masked_mean_or_zero(seg_gate_neg.float(), response_mask).item()
+            stats["actor/seg_gate_severe_fraction"] = _masked_mean_or_zero(
+                seg_gate_severe.float(), response_mask
+            ).item()
+            stats["actor/seg_gate_neg_weight"] = float(getattr(config, "seg_gate_neg_weight", 0.3))
+            stats["actor/seg_gate_severe_weight"] = float(getattr(config, "seg_gate_severe_weight", 0.1))
+            stats["actor/seg_gate_size"] = float(getattr(config, "seg_gate_size", 128))
+            stats["actor/seg_gate_neg_segment_count"] = seg_gate_neg_segment_count.item()
+            stats["actor/seg_gate_severe_segment_count"] = seg_gate_severe_segment_count.item()
+        if seg_gate_pos is not None:
+            stats["actor/seg_gate_pos_fraction"] = _masked_mean_or_zero(seg_gate_pos.float(), response_mask).item()
+            stats["actor/seg_gate_pos_segment_count"] = seg_gate_pos_segment_count.item()
+
+    if raw_delta is not None and bool(getattr(config, "seq_mismatch_gate_enable", False)):
+        response_mask_f = response_mask.to(dtype=log_prob.dtype)
+        seq_active = response_mask.any(dim=-1)
+        seq_count = response_mask_f.sum(dim=-1).clamp_min(1.0)
+        seq_mismatch_delta = ((old_log_prob.detach() - rollout_log_prob) * response_mask_f).sum(dim=-1) / seq_count
+        seq_prox_delta = ((log_prob.detach() - old_log_prob.detach()) * response_mask_f).sum(dim=-1) / seq_count
+        seq_adv = (advantages.detach() * response_mask_f).sum(dim=-1) / seq_count
+
+        mismatch_bad = torch.zeros_like(seq_active, dtype=torch.bool)
+        gate_delta_min = getattr(config, "seq_mismatch_gate_delta_min", None)
+        gate_delta_max = getattr(config, "seq_mismatch_gate_delta_max", None)
+        if gate_delta_min is not None:
+            mismatch_bad = mismatch_bad | (seq_mismatch_delta < float(gate_delta_min))
+        if gate_delta_max is not None:
+            mismatch_bad = mismatch_bad | (seq_mismatch_delta > float(gate_delta_max))
+
+        neg_prox_bad = torch.zeros_like(seq_active, dtype=torch.bool)
+        neg_prox_delta_max = getattr(config, "seq_mismatch_gate_neg_prox_delta_max", None)
+        if neg_prox_delta_max is not None:
+            neg_adv_max = float(getattr(config, "seq_mismatch_gate_neg_adv_max", 0.0))
+            neg_prox_bad = (seq_adv < neg_adv_max) & (seq_prox_delta > float(neg_prox_delta_max))
+
+        bad_seq = seq_active & (mismatch_bad | neg_prox_bad)
+        bad_weight = min(max(float(getattr(config, "seq_mismatch_gate_bad_weight", 0.3)), 0.0), 1.0)
+        seq_weight = torch.where(
+            bad_seq,
+            torch.full_like(seq_mismatch_delta, bad_weight),
+            torch.ones_like(seq_mismatch_delta),
+        )
+        pg_response_mask = pg_response_mask.to(dtype=log_prob.dtype) * torch.where(
+            response_mask,
+            seq_weight.unsqueeze(-1),
+            torch.ones_like(pg_response_mask, dtype=log_prob.dtype),
+        )
+        stats["actor/seq_mismatch_gate_weight_mean"] = _masked_mean_or_zero(seq_weight.float(), seq_active).item()
+        stats["actor/seq_mismatch_gate_bad_seq_fraction"] = _masked_mean_or_zero(bad_seq.float(), seq_active).item()
+        stats["actor/seq_mismatch_gate_mismatch_bad_seq_fraction"] = _masked_mean_or_zero(
+            (mismatch_bad & seq_active).float(), seq_active
+        ).item()
+        stats["actor/seq_mismatch_gate_neg_prox_bad_seq_fraction"] = _masked_mean_or_zero(
+            (neg_prox_bad & seq_active).float(), seq_active
+        ).item()
+        stats["actor/seq_mismatch_gate_seq_mismatch_delta_mean"] = _masked_mean_or_zero(
+            seq_mismatch_delta.detach(), seq_active
+        ).item()
+        stats["actor/seq_mismatch_gate_seq_prox_delta_mean"] = _masked_mean_or_zero(
+            seq_prox_delta.detach(), seq_active
+        ).item()
+        stats["actor/seq_mismatch_gate_bad_weight"] = bad_weight
+        if gate_delta_min is not None:
+            stats["actor/seq_mismatch_gate_delta_min"] = float(gate_delta_min)
+        if gate_delta_max is not None:
+            stats["actor/seq_mismatch_gate_delta_max"] = float(gate_delta_max)
+        if neg_prox_delta_max is not None:
+            stats["actor/seq_mismatch_gate_neg_prox_delta_max"] = float(neg_prox_delta_max)
+
+    saved_global_batch_info = dict(getattr(config, "global_batch_info", {}) or {})
+    if hasattr(config, "global_batch_info"):
+        if (
+            loss_agg_mode == "seq-mean-token-sum-norm"
+            and bool(getattr(config, "seq_norm_adaptive_enable", False))
+        ):
+            response_lengths = response_mask.to(dtype=log_prob.dtype).sum(dim=-1).clamp_min(1.0)
+            seq_active = response_mask.any(dim=-1)
+            active_lengths = response_lengths[seq_active]
+            if active_lengths.numel() > 0:
+                q = min(max(float(getattr(config, "seq_norm_adaptive_quantile", 0.95)), 1e-6), 1.0)
+                p_batch = torch.quantile(active_lengths.detach().float(), q)
+                # p_used = GLOBAL whole-batch P95 (computed once per update across the DP group);
+                # falls back to this micro-batch's local P95 only if unavailable. Per-micro-batch
+                # local P95 is unreliable late in training: token-budgeted micro-batches hold only
+                # ~2-3 long sequences, so the local "P95" ~= the longest of 3. p_batch is kept as
+                # the local-P95 stat for comparison.
+                p_used = float(seq_norm_p95) if seq_norm_p95 is not None else float(p_batch.detach().item())
+
+                # Bands: 2048, 4096, then ceil(p95 / 4096) * 4096, capped at the padded response
+                # width (= max_response_length). The denom tracks length across the full range
+                # instead of saturating at a fixed top band.
+                max_resp = float(response_mask.shape[-1])
+                if p_used < 2048.0:
+                    short_denom = 2048.0
+                elif p_used < 4096.0:
+                    short_denom = 4096.0
+                else:
+                    _blocks = int(p_used // 4096.0)
+                    if p_used > _blocks * 4096.0:
+                        _blocks += 1
+                    short_denom = min(float(_blocks) * 4096.0, max_resp)
+                tail_denom = float(getattr(config, "seq_norm_adaptive_tail_denom", 20480.0))
+                # Tail = sequences above the batch p95 (relative outliers).
+                #   tail_power == 0 (default): legacy constant tail_denom (back-compat / "just cap").
+                #   tail_power  > 0: outlier-damping. The denom grows super-linearly with how far L
+                #     overshoots p95, so contribution ~ (p95/L)^(tail_power-1): a relative outlier
+                #     (others 2K, you 20K) is progressively DOWN-weighted. Adaptive -- keyed on
+                #     L/p95, so it only bites the rare long-vs-its-own-batch sequence, not a batch
+                #     in which everything is long.
+                tail_power = float(getattr(config, "seq_norm_adaptive_tail_power", 0.0))
+                if tail_power > 0.0:
+                    overshoot = (response_lengths / max(p_used, 1.0)).clamp_min(1.0)
+                    tail_scale = short_denom * torch.pow(overshoot, tail_power)
+                else:
+                    tail_scale = torch.full_like(response_lengths, tail_denom)
+                loss_scale_factor = torch.where(
+                    response_lengths <= p_used,
+                    torch.full_like(response_lengths, short_denom),
+                    tail_scale,
+                )
+                config.global_batch_info["loss_scale_factor"] = loss_scale_factor
+                stats["actor/seq_norm_adaptive_p_quantile"] = q
+                stats["actor/seq_norm_adaptive_p_batch"] = float(p_batch.detach().item())
+                stats["actor/seq_norm_adaptive_p_used"] = p_used
+                stats["actor/seq_norm_adaptive_short_denom"] = short_denom
+                stats["actor/seq_norm_adaptive_tail_denom"] = tail_denom
+                stats["actor/seq_norm_adaptive_tail_fraction"] = _masked_mean_or_zero(
+                    (response_lengths > p_used).float(), seq_active
+                ).item()
+                stats["actor/seq_norm_adaptive_denom_mean"] = _masked_mean_or_zero(
+                    loss_scale_factor.float(), seq_active
+                ).item()
+        if loss_agg_mode == "token-mean":
+            weighted_count = pg_response_mask.to(dtype=log_prob.dtype).sum().clamp_min(1.0)
+            config.global_batch_info["batch_num_tokens"] = _global_sum_scalar(weighted_count, dp_group).clamp_min(1.0)
+        elif loss_agg_mode == "seq-mean-token-mean":
+            active_seq = (pg_response_mask.to(dtype=log_prob.dtype).sum(dim=-1) > 0).to(dtype=log_prob.dtype).sum()
+            config.global_batch_info["global_batch_size"] = _global_sum_scalar(active_seq, dp_group).clamp_min(1.0)
+    try:
+        if raw_delta is not None and bool(getattr(config, "seq_tbpo_enable", False)):
+            response_mask_f = response_mask.to(dtype=log_prob.dtype)
+            seq_active = response_mask.any(dim=-1)
+            seq_count = response_mask_f.sum(dim=-1).clamp_min(1.0)
+            seq_adv = (pg_advantages * response_mask_f).sum(dim=-1) / seq_count
+            seq_mask_weight = (pg_response_mask.to(dtype=log_prob.dtype) * response_mask_f).sum(dim=-1) / seq_count
+
+            seq_prox_logratio = ((log_prob - old_log_prob.detach()) * response_mask_f).sum(dim=-1) / seq_count
+            seq_prox_logratio = torch.clamp(seq_prox_logratio, min=-20.0, max=20.0)
+            seq_ratio = torch.exp(seq_prox_logratio)
+
+            seq_mismatch_logratio = ((old_log_prob.detach() - rollout_log_prob.detach()) * response_mask_f).sum(
+                dim=-1
+            ) / seq_count
+            tis_cap = max(float(getattr(config, "seq_tbpo_tis_imp_ratio_cap", 2.0)), 1.0)
+            log_tis_cap = torch.log(log_prob.new_tensor(tis_cap))
+            seq_mismatch_weight = torch.exp(torch.clamp(seq_mismatch_logratio, min=-log_tis_cap, max=log_tis_cap))
+
+            pos_high = max(float(getattr(config, "seq_tbpo_clip_ratio_high", 0.001)), 0.0)
+            neg_low = max(float(getattr(config, "seq_tbpo_neg_clip_ratio_low", 0.001)), 0.0)
+            neg_high = max(float(getattr(config, "seq_tbpo_neg_clip_ratio_high", 0.001)), 0.0)
+            pos_clipped_ratio = torch.clamp(seq_ratio, min=0.0, max=1.0 + pos_high)
+            neg_clipped_ratio = torch.clamp(seq_ratio, min=max(0.0, 1.0 - neg_low), max=1.0 + neg_high)
+            seq_clipped_ratio = torch.where(seq_adv >= 0, pos_clipped_ratio, neg_clipped_ratio)
+
+            seq_loss_vec = -seq_mismatch_weight * seq_clipped_ratio * seq_adv * seq_mask_weight
+            pg_loss = _masked_mean_or_zero(seq_loss_vec, seq_active)
+            pg_metrics = {
+                "actor/pg_clipfrac": _masked_mean_or_zero(
+                    ((seq_adv >= 0) & (seq_ratio > 1.0 + pos_high)).float(), seq_active
+                ).item(),
+                "actor/ppo_kl": _masked_mean_or_zero((-seq_prox_logratio).detach(), seq_active).item(),
+                "actor/pg_clipfrac_lower": _masked_mean_or_zero(
+                    ((seq_adv < 0) & ((seq_ratio < max(0.0, 1.0 - neg_low)) | (seq_ratio > 1.0 + neg_high))).float(),
+                    seq_active,
+                ).item(),
+            }
+            stats["actor/seq_tbpo_enable"] = 1.0
+            stats["actor/seq_tbpo_seq_ratio_mean"] = _masked_mean_or_zero(seq_ratio.detach(), seq_active).item()
+            stats["actor/seq_tbpo_seq_ratio_clipped_mean"] = _masked_mean_or_zero(
+                seq_clipped_ratio.detach(), seq_active
+            ).item()
+            stats["actor/seq_tbpo_mismatch_weight_mean"] = _masked_mean_or_zero(
+                seq_mismatch_weight.detach(), seq_active
+            ).item()
+            stats["actor/seq_tbpo_seq_prox_logratio_mean"] = _masked_mean_or_zero(
+                seq_prox_logratio.detach(), seq_active
+            ).item()
+            stats["actor/seq_tbpo_seq_mismatch_logratio_mean"] = _masked_mean_or_zero(
+                seq_mismatch_logratio.detach(), seq_active
+            ).item()
+            stats["actor/seq_tbpo_seq_mask_weight_mean"] = _masked_mean_or_zero(
+                seq_mask_weight.detach(), seq_active
+            ).item()
+            stats["actor/seq_tbpo_clip_ratio_high"] = pos_high
+            stats["actor/seq_tbpo_neg_clip_ratio_low"] = neg_low
+            stats["actor/seq_tbpo_neg_clip_ratio_high"] = neg_high
+            stats["actor/seq_tbpo_tis_imp_ratio_cap"] = tis_cap
+        else:
+            pg_loss, pg_metrics = policy_loss_fn(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=pg_advantages,
+                response_mask=pg_response_mask,
+                loss_agg_mode=loss_agg_mode,
+                config=config,
+                rollout_is_weights=rollout_is_weights,
+            )
+    finally:
+        if hasattr(config, "global_batch_info"):
+            config.global_batch_info.clear()
+            config.global_batch_info.update(saved_global_batch_info)
+
+    stats.update(pg_metrics)
+    response_mask_f = response_mask.to(dtype=log_prob.dtype)
+    token_weight = pg_response_mask.to(dtype=log_prob.dtype) * response_mask_f
+    pressure = torch.abs(pg_advantages.detach()) * token_weight
+    total_pressure = pressure.sum().clamp_min(1e-12)
+    stats["actor_diag/pg_effective_token_fraction"] = _masked_mean_or_zero(token_weight, response_mask).item()
+    stats["actor_diag/pg_pressure_share_neg_adv"] = (
+        _masked_sum_or_zero(pressure, (advantages.detach() < 0) & response_mask) / total_pressure
+    ).item()
+    stats["actor_diag/pg_pressure_share_pos_adv"] = (
+        _masked_sum_or_zero(pressure, (advantages.detach() > 0) & response_mask) / total_pressure
+    ).item()
+
+    return pg_loss, stats, seg_gate_pos
+
+
+def _add_gap_guard_aux_losses(
+    *,
+    config: ActorConfig,
+    policy_loss: torch.Tensor,
+    log_prob: torch.Tensor,
+    rollout_log_prob: torch.Tensor | None,
+    response_mask: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_agg_mode: str,
+    seg_gate_pos: torch.Tensor | None,
+    dp_group=None,
+    local_segment_align_step_mean: torch.Tensor | None = None,
+    local_segment_align_step_clip_ratio: torch.Tensor | None = None,
+    local_segment_align_tail_mass: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict]:
+    if rollout_log_prob is None:
+        return policy_loss, {}
+
+    rollout_log_prob = rollout_log_prob.detach()
+    raw_delta = log_prob - rollout_log_prob
+    stats = {}
+
+    def add_align_loss(prefix: str, coef: float, *, hard: bool = False) -> None:
+        nonlocal policy_loss
+        if coef <= 0.0:
+            return
+        key = "vllm_align_hard" if hard else "vllm_align"
+        loss_type = str(getattr(config, f"{key}_loss_type", "huber" if hard else "k3")).strip().lower()
+        token_obj = _align_token_objective(raw_delta, loss_type, float(getattr(config, f"{key}_huber_beta", 1.0)))
+        loss_cap = getattr(config, f"{key}_loss_cap", None)
+        if loss_cap is not None:
+            token_obj = torch.clamp(token_obj, max=float(loss_cap))
+        align_window = _delta_window(
+            response_mask=response_mask,
+            raw_delta=raw_delta,
+            delta_min=getattr(config, f"{key}_delta_min", None),
+            delta_max=getattr(config, f"{key}_delta_max", None),
+            abs_delta_min=getattr(config, f"{key}_abs_delta_min", None),
+            abs_delta_max=getattr(config, f"{key}_abs_delta_max", None),
+        )
+        adv_min = getattr(config, f"{key}_adv_min", None)
+        adv_max = getattr(config, f"{key}_adv_max", None)
+        if adv_min is not None:
+            align_window = align_window & (advantages.detach() >= float(adv_min))
+        if adv_max is not None:
+            align_window = align_window & (advantages.detach() <= float(adv_max))
+        if (not hard) and bool(getattr(config, "vllm_align_segment_pos_enable", False)):
+            if seg_gate_pos is None:
+                align_window = align_window & torch.zeros_like(response_mask, dtype=torch.bool)
+            else:
+                align_window = align_window & seg_gate_pos
+
+        token_weight = align_window.to(dtype=token_obj.dtype)
+        align_count = token_weight.sum()
+        response_count = response_mask.to(dtype=token_obj.dtype).sum().clamp_min(1.0)
+        if bool(getattr(config, f"{key}_normalize_by_window", False)):
+            min_fraction = float(getattr(config, f"{key}_min_window_fraction", 0.0)) if not hard else 0.0
+            denom = torch.maximum(align_count, response_count * max(min_fraction, 0.0)).clamp_min(1.0)
+            align_loss = (token_obj * token_weight).sum() / denom
+            if align_count.detach().item() <= 0:
+                align_loss = token_obj.sum() * 0.0
+        else:
+            align_loss = agg_loss(
+                loss_mat=token_obj * token_weight,
+                loss_mask=response_mask,
+                loss_agg_mode=loss_agg_mode,
+                **config.global_batch_info,
+            )
+        policy_loss = policy_loss + coef * align_loss
+
+        window_fraction = _masked_mean_or_zero(align_window.float(), response_mask)
+        gap_mean = _masked_mean_or_zero(raw_delta.detach(), align_window)
+        stats[f"{prefix}_loss"] = align_loss.detach().item()
+        stats[f"{prefix}_coef"] = coef
+        stats[f"{prefix}_window_fraction"] = window_fraction.detach().item()
+        stats[f"{prefix}_logprob_gap_mean"] = gap_mean.detach().item()
+        stats[f"{prefix}_active_weight_sum"] = align_count.detach().item()
+        stats[f"{prefix}_denom_token_count"] = (
+            torch.maximum(align_count, response_count * float(getattr(config, f"{key}_min_window_fraction", 0.0)))
+            .clamp_min(1.0)
+            .detach()
+            .item()
+        )
+        if (not hard) and bool(getattr(config, "vllm_align_segment_pos_enable", False)):
+            stats[f"{prefix}_segment_pos_gated"] = 1.0
+
+    if bool(getattr(config, "vllm_align_enable", False)):
+        add_align_loss("actor/vllm_align", float(getattr(config, "vllm_align_coef", 0.0)), hard=False)
+    if bool(getattr(config, "vllm_align_hard_enable", False)):
+        add_align_loss("actor/vllm_align_hard", float(getattr(config, "vllm_align_hard_coef", 0.0)), hard=True)
+
+    if bool(getattr(config, "delta_mean_guard_enable", False)):
+        coef = float(getattr(config, "delta_mean_guard_coef", 0.0))
+        if coef > 0.0:
+            target = float(getattr(config, "delta_mean_guard_target", -0.01))
+            mode = str(getattr(config, "delta_mean_guard_mode", "token")).strip().lower()
+            guard_mask = _delta_window(
+                response_mask=response_mask,
+                raw_delta=raw_delta,
+                delta_min=getattr(config, "delta_mean_guard_delta_min", None),
+                delta_max=getattr(config, "delta_mean_guard_delta_max", None),
+                abs_delta_min=None,
+                abs_delta_max=None,
+            )
+            adv_min = getattr(config, "delta_mean_guard_adv_min", None)
+            adv_max = getattr(config, "delta_mean_guard_adv_max", None)
+            if adv_min is not None:
+                guard_mask = guard_mask & (advantages.detach() >= float(adv_min))
+            if adv_max is not None:
+                guard_mask = guard_mask & (advantages.detach() <= float(adv_max))
+
+            guard_weight = guard_mask.to(dtype=raw_delta.dtype)
+            guard_count = guard_weight.sum()
+            if guard_count.detach().item() <= 0:
+                guard_loss = raw_delta.sum() * 0.0
+                guard_mean = raw_delta.sum().detach() * 0.0
+                active_seq_fraction = raw_delta.sum().detach() * 0.0
+            elif mode == "seq":
+                seq_count = guard_weight.sum(dim=-1)
+                seq_active = seq_count > 0
+                seq_delta = (raw_delta * guard_weight).sum(dim=-1) / seq_count.clamp_min(1.0)
+                seq_penalty = F.relu(target - seq_delta).pow(2)
+                guard_loss = _masked_mean_or_zero(seq_penalty, seq_active)
+                guard_mean = _masked_mean_or_zero(seq_delta.detach(), seq_active)
+                active_seq_fraction = _masked_mean_or_zero(seq_active.float(), response_mask.any(dim=-1))
+            else:
+                guard_mean = (raw_delta * guard_weight).sum() / guard_count.clamp_min(1.0)
+                guard_loss = F.relu(target - guard_mean).pow(2)
+                active_seq_fraction = _masked_mean_or_zero(
+                    (guard_weight.sum(dim=-1) > 0).float(), response_mask.any(dim=-1)
+                )
+
+            loss_cap = getattr(config, "delta_mean_guard_loss_cap", None)
+            if loss_cap is not None:
+                guard_loss = torch.clamp(guard_loss, max=float(loss_cap))
+            policy_loss = policy_loss + coef * guard_loss
+            stats["actor/delta_mean_guard_loss"] = guard_loss.detach().item()
+            stats["actor/delta_mean_guard_coef"] = coef
+            stats["actor/delta_mean_guard_target"] = target
+            stats["actor/delta_mean_guard_mean_delta"] = guard_mean.detach().item()
+            stats["actor/delta_mean_guard_active_fraction"] = (
+                _masked_mean_or_zero(guard_mask.float(), response_mask).detach().item()
+            )
+            stats["actor/delta_mean_guard_active_seq_fraction"] = active_seq_fraction.detach().item()
+            stats["actor/delta_mean_guard_contribution"] = (coef * guard_loss.detach()).item()
+
+    if bool(getattr(config, "local_segment_align_enable", False)):
+        coef = float(getattr(config, "local_segment_align_coef", 0.0))
+        if coef > 0.0:
+            target = float(getattr(config, "local_segment_align_target", -0.03))
+            segment_size = max(int(getattr(config, "local_segment_align_size", 128)), 1)
+            response_mask_f = response_mask.to(dtype=raw_delta.dtype)
+            response_lengths = response_mask_f.sum(dim=-1).clamp_min(1.0)
+            seq_active = response_mask.any(dim=-1)
+            active_lengths = response_lengths[seq_active]
+
+            gate_enabled = bool(getattr(config, "local_segment_align_length_gate_enable", False))
+            gate_quantile = min(
+                max(float(getattr(config, "local_segment_align_length_gate_quantile", 0.95)), 1e-6), 1.0
+            )
+            gate_min = float(getattr(config, "local_segment_align_length_gate_min", 8192.0))
+            gate_mean_min = float(getattr(config, "local_segment_align_length_gate_mean_min", 7000.0))
+            gate_clip_ratio_min = float(getattr(config, "local_segment_align_length_gate_clip_ratio_min", 0.02))
+            if active_lengths.numel() > 0:
+                gate_p = torch.quantile(active_lengths.detach().float(), gate_quantile)
+                gate_p_value = float(gate_p.detach().item())
+            else:
+                gate_p_value = float("nan")
+
+            local_seq_count = seq_active.to(dtype=raw_delta.dtype).sum()
+            local_token_sum = (response_lengths * seq_active.to(dtype=raw_delta.dtype)).sum()
+            max_response_len = float(response_mask.shape[-1])
+            local_clip_count = ((response_lengths >= max_response_len) & seq_active).to(dtype=raw_delta.dtype).sum()
+            global_seq_count = _global_sum_scalar(local_seq_count, dp_group).clamp_min(1.0)
+            global_token_sum = _global_sum_scalar(local_token_sum, dp_group)
+            global_clip_count = _global_sum_scalar(local_clip_count, dp_group)
+            gate_mean = global_token_sum / global_seq_count
+            gate_clip_ratio = global_clip_count / global_seq_count
+            if gate_enabled:
+                gate_active_tensor = (gate_mean >= gate_mean_min) & (gate_clip_ratio >= gate_clip_ratio_min)
+                gate_factor = gate_active_tensor.to(dtype=raw_delta.dtype)
+                gate_active = bool(gate_active_tensor.detach().item())
+            else:
+                gate_factor = raw_delta.new_tensor(1.0)
+                gate_active = True
+
+            adaptive_tail_enabled = bool(getattr(config, "local_segment_align_adaptive_tail_enable", False))
+            adaptive_tail_clip_gate_enabled = bool(
+                getattr(config, "local_segment_align_adaptive_tail_clip_gate_enable", False)
+            )
+            adaptive_tail_uniform_weight = bool(
+                getattr(config, "local_segment_align_adaptive_tail_uniform_weight", False)
+            )
+            adaptive_offset = float(getattr(config, "local_segment_align_adaptive_tail_offset", 4096.0))
+            adaptive_min_start = float(getattr(config, "local_segment_align_adaptive_tail_min_start", 8192.0))
+            adaptive_max_start = float(getattr(config, "local_segment_align_adaptive_tail_max_start", 14336.0))
+            adaptive_width = max(float(getattr(config, "local_segment_align_adaptive_tail_width", 4096.0)), 1e-6)
+            adaptive_tail_mass_min = float(getattr(config, "local_segment_align_adaptive_tail_mass_min", 0.02))
+            adaptive_clip_ratio_min = float(
+                getattr(config, "local_segment_align_adaptive_tail_clip_ratio_min", gate_clip_ratio_min)
+            )
+            if local_segment_align_step_mean is not None and local_segment_align_step_mean.numel() > 0:
+                step_mean = local_segment_align_step_mean.to(dtype=raw_delta.dtype).flatten()[0]
+            else:
+                step_mean = gate_mean.detach().to(dtype=raw_delta.dtype)
+            if local_segment_align_step_clip_ratio is not None and local_segment_align_step_clip_ratio.numel() > 0:
+                step_clip_ratio = local_segment_align_step_clip_ratio.to(dtype=raw_delta.dtype).flatten()[0]
+            else:
+                step_clip_ratio = gate_clip_ratio.detach().to(dtype=raw_delta.dtype)
+            adaptive_start = torch.clamp(
+                step_mean + raw_delta.new_tensor(adaptive_offset), min=adaptive_min_start, max=adaptive_max_start
+            )
+            adaptive_full = adaptive_start + raw_delta.new_tensor(adaptive_width)
+            length_weight = torch.clamp((response_lengths - adaptive_start) / adaptive_width, min=0.0, max=1.0)
+            length_weight = torch.where(seq_active, length_weight, torch.zeros_like(length_weight))
+            if local_segment_align_tail_mass is not None and local_segment_align_tail_mass.numel() > 0:
+                tail_mass = local_segment_align_tail_mass.to(dtype=raw_delta.dtype).flatten()[0]
+            else:
+                tail_mass = _masked_mean_or_zero(length_weight, seq_active)
+            if adaptive_tail_enabled:
+                adaptive_gate_active_tensor = tail_mass >= adaptive_tail_mass_min
+                if adaptive_tail_clip_gate_enabled:
+                    adaptive_gate_active_tensor = adaptive_gate_active_tensor & (step_clip_ratio >= adaptive_clip_ratio_min)
+                adaptive_gate_factor = adaptive_gate_active_tensor.to(dtype=raw_delta.dtype)
+                gate_factor = gate_factor * adaptive_gate_factor
+                adaptive_gate_active = bool(adaptive_gate_active_tensor.detach().item())
+                if adaptive_tail_uniform_weight:
+                    length_weight = torch.where(
+                        seq_active, torch.ones_like(length_weight), torch.zeros_like(length_weight)
+                    )
+            else:
+                adaptive_gate_factor = raw_delta.new_tensor(1.0)
+                adaptive_gate_active = False
+                length_weight = torch.ones_like(response_lengths, dtype=raw_delta.dtype)
+                tail_mass = _masked_mean_or_zero(length_weight, seq_active)
+
+            kl_gate_enabled = bool(getattr(config, "local_segment_align_kl_gate_enable", False))
+            kl_gate_start = float(getattr(config, "local_segment_align_kl_gate_start", 0.01))
+            kl_gate_full = float(getattr(config, "local_segment_align_kl_gate_full", 0.02))
+            kl_gate_min_factor = float(getattr(config, "local_segment_align_kl_gate_min_factor", 0.0))
+            kl_gate_max_factor = float(getattr(config, "local_segment_align_kl_gate_max_factor", 1.0))
+            kl_gate_min_factor = min(max(kl_gate_min_factor, 0.0), 1.0)
+            kl_gate_max_factor = min(max(kl_gate_max_factor, 0.0), 1.0)
+            kl_gate_max_factor = max(kl_gate_max_factor, kl_gate_min_factor)
+            kl_gate_value = -_masked_mean_or_zero(raw_delta.detach(), response_mask)
+            if kl_gate_enabled:
+                denom = max(kl_gate_full - kl_gate_start, 1e-6)
+                kl_gate_progress = torch.clamp((kl_gate_value - kl_gate_start) / denom, min=0.0, max=1.0)
+                kl_gate_factor = raw_delta.new_tensor(kl_gate_min_factor) + kl_gate_progress.to(
+                    dtype=raw_delta.dtype
+                ) * (kl_gate_max_factor - kl_gate_min_factor)
+                gate_factor = gate_factor * kl_gate_factor
+            else:
+                kl_gate_factor = raw_delta.new_tensor(1.0)
+                kl_gate_progress = raw_delta.new_tensor(1.0)
+
+            seq_len = raw_delta.shape[-1]
+            segment_losses = []
+            segment_deltas = []
+            segment_active = []
+            segment_unweighted_active = []
+            for start in range(0, seq_len, segment_size):
+                end = min(start + segment_size, seq_len)
+                seg_mask_f = response_mask_f[:, start:end]
+                token_count = seg_mask_f.sum(dim=-1)
+                valid_seg = token_count > 0
+                seg_delta = (raw_delta[:, start:end] * seg_mask_f).sum(dim=-1) / token_count.clamp_min(1.0)
+                seg_penalty = F.relu(target - seg_delta).pow(2)
+                loss_cap = getattr(config, "local_segment_align_loss_cap", None)
+                if loss_cap is not None:
+                    seg_penalty = torch.clamp(seg_penalty, max=float(loss_cap))
+                weighted_penalty = seg_penalty * length_weight
+                segment_losses.append(torch.where(valid_seg, weighted_penalty, torch.zeros_like(weighted_penalty)))
+                segment_deltas.append(seg_delta.detach())
+                segment_active.append(valid_seg)
+                segment_unweighted_active.append(valid_seg & (seg_penalty.detach() > 0))
+
+            all_losses = torch.stack(segment_losses, dim=-1)
+            all_deltas = torch.stack(segment_deltas, dim=-1)
+            all_valid = torch.stack(segment_active, dim=-1)
+            all_unweighted_active = torch.stack(segment_unweighted_active, dim=-1)
+            valid_count = all_valid.to(dtype=raw_delta.dtype).sum()
+            if valid_count.detach().item() <= 0:
+                align_loss = raw_delta.sum() * 0.0
+                align_loss_raw = raw_delta.sum() * 0.0
+                mean_delta = raw_delta.sum().detach() * 0.0
+                active_fraction = raw_delta.sum().detach() * 0.0
+                weighted_active_fraction = raw_delta.sum().detach() * 0.0
+            else:
+                align_loss_raw = all_losses.sum() / valid_count.clamp_min(1.0)
+                align_loss = align_loss_raw * gate_factor
+                mean_delta = _masked_mean_or_zero(all_deltas, all_valid)
+                active_fraction = _masked_mean_or_zero(all_unweighted_active.float(), all_valid)
+                weighted_active_fraction = _masked_mean_or_zero((all_losses.detach() > 0).float(), all_valid)
+
+            policy_loss = policy_loss + coef * align_loss
+            stats["actor/local_segment_align_loss"] = align_loss.detach().item()
+            stats["actor/local_segment_align_loss_raw"] = align_loss_raw.detach().item()
+            stats["actor/local_segment_align_coef"] = coef
+            stats["actor/local_segment_align_contribution"] = (coef * align_loss.detach()).item()
+            stats["actor/local_segment_align_target"] = target
+            stats["actor/local_segment_align_size"] = float(segment_size)
+            stats["actor/local_segment_align_mean_delta"] = mean_delta.detach().item()
+            stats["actor/local_segment_align_active_segment_fraction"] = active_fraction.detach().item()
+            stats["actor/local_segment_align_weighted_segment_fraction"] = weighted_active_fraction.detach().item()
+            stats["actor/local_segment_align_valid_segment_count"] = valid_count.detach().item()
+            stats["actor/local_segment_align_length_gate_enable"] = float(gate_enabled)
+            stats["actor/local_segment_align_length_gate_active"] = float(gate_active)
+            stats["actor/local_segment_align_length_gate_quantile"] = gate_quantile
+            stats["actor/local_segment_align_length_gate_min"] = gate_min
+            stats["actor/local_segment_align_length_gate_p"] = gate_p_value
+            stats["actor/local_segment_align_length_gate_mean"] = gate_mean.detach().item()
+            stats["actor/local_segment_align_length_gate_mean_min"] = gate_mean_min
+            stats["actor/local_segment_align_length_gate_clip_ratio"] = gate_clip_ratio.detach().item()
+            stats["actor/local_segment_align_length_gate_clip_ratio_min"] = gate_clip_ratio_min
+            stats["actor/local_segment_align_adaptive_tail_enable"] = float(adaptive_tail_enabled)
+            stats["actor/local_segment_align_adaptive_gate_active"] = float(adaptive_gate_active)
+            stats["actor/local_segment_align_adaptive_gate_factor"] = adaptive_gate_factor.detach().item()
+            stats["actor/local_segment_align_adaptive_start"] = adaptive_start.detach().item()
+            stats["actor/local_segment_align_adaptive_full"] = adaptive_full.detach().item()
+            stats["actor/local_segment_align_adaptive_tail_mass"] = tail_mass.detach().item()
+            stats["actor/local_segment_align_adaptive_tail_mass_min"] = adaptive_tail_mass_min
+            stats["actor/local_segment_align_adaptive_step_mean"] = step_mean.detach().item()
+            stats["actor/local_segment_align_adaptive_step_clip_ratio"] = step_clip_ratio.detach().item()
+            stats["actor/local_segment_align_adaptive_clip_gate_enable"] = float(adaptive_tail_clip_gate_enabled)
+            stats["actor/local_segment_align_adaptive_clip_ratio_min"] = adaptive_clip_ratio_min
+            stats["actor/local_segment_align_adaptive_tail_uniform_weight"] = float(adaptive_tail_uniform_weight)
+            stats["actor/local_segment_align_adaptive_length_weight_mean"] = _masked_mean_or_zero(
+                length_weight.detach(), seq_active
+            ).item()
+            stats["actor/local_segment_align_kl_gate_enable"] = float(kl_gate_enabled)
+            stats["actor/local_segment_align_kl_gate_value"] = kl_gate_value.detach().item()
+            stats["actor/local_segment_align_kl_gate_start"] = kl_gate_start
+            stats["actor/local_segment_align_kl_gate_full"] = kl_gate_full
+            stats["actor/local_segment_align_kl_gate_min_factor"] = kl_gate_min_factor
+            stats["actor/local_segment_align_kl_gate_max_factor"] = kl_gate_max_factor
+            stats["actor/local_segment_align_kl_gate_factor"] = kl_gate_factor.detach().item()
+            stats["actor/local_segment_align_kl_gate_progress"] = kl_gate_progress.detach().item()
+
+    return policy_loss, stats
+
 
 
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
@@ -1162,8 +2244,7 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
-@register_policy_loss("vanilla")  # type: ignore[arg-type]
-def compute_policy_loss_vanilla(
+def _compute_policy_loss_vanilla_base(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
     advantages: torch.Tensor,
@@ -1253,6 +2334,47 @@ def compute_policy_loss_vanilla(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("vanilla")  # type: ignore[arg-type]
+def compute_policy_loss_vanilla(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    rollout_log_probs: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    response_mask = response_mask.to(torch.bool)
+    pg_loss, pg_metrics, seg_gate_pos = _apply_gap_guard_policy_loss(
+        config=config,
+        policy_loss_fn=_compute_policy_loss_vanilla_base,
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        rollout_is_weights=rollout_is_weights,
+        rollout_log_prob=rollout_log_probs,
+        dp_group=None,
+    )
+    pg_loss, aux_metrics = _add_gap_guard_aux_losses(
+        config=config,
+        policy_loss=pg_loss,
+        log_prob=log_prob,
+        rollout_log_prob=rollout_log_probs,
+        response_mask=response_mask,
+        advantages=advantages,
+        loss_agg_mode=loss_agg_mode,
+        seg_gate_pos=seg_gate_pos,
+        dp_group=None,
+    )
+    pg_metrics.update(aux_metrics)
     return pg_loss, pg_metrics
 
 

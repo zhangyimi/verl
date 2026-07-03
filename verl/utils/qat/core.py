@@ -36,6 +36,7 @@ class QATConfig(BaseConfig):
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
+    activation_observer_update_interval: int = 1  # PERF: update activation amax every N optimizer steps
     quantization_config_path: Optional[str] = None
 
 
@@ -118,7 +119,9 @@ def apply_qat(
             mode=mode,
             group_size=config.group_size,
             activation_observer=config.activation_observer,
+            activation_observer_update_interval=getattr(config, 'activation_observer_update_interval', 1),
         )
+        fake_quant_module._qat_clean_name = name  # pre-FSDP name for state_dict-free input_global_scale re-inject
 
         _set_module(model, name, fake_quant_module)
         converted_count += 1
@@ -194,6 +197,19 @@ def invalidate_all_scales(model: nn.Module):
             count += 1
 
     logger.debug(f"[QAT Fuse] Invalidated scales for {count} QATLinear layers")
+
+
+def set_qat_observer_train_step(model: nn.Module, step: int):
+    """PERF (W4A4): push the optimizer-step index to all QATLinear modules so the
+    activation amax observer can gate its update to every N steps (see
+    QATLinear._should_update_activation_observer). Call right after optimizer.step()."""
+    n = 0
+    for module in model.modules():
+        setter = getattr(module, "set_activation_observer_train_step", None)
+        if callable(setter):
+            setter(step)
+            n += 1
+    return n
 
 
 def sync_qat_input_amax(model: nn.Module):

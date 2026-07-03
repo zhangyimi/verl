@@ -47,8 +47,13 @@ class TestBuildCliArgsFromConfig:
         assert result == ["--enable-prefix-caching"]
 
     def test_bool_false(self):
-        """Bool False is skipped entirely."""
+        """BooleanOptionalAction False uses its explicit negative flag."""
         config = {"enable-prefix-caching": False}
+        result = build_cli_args_from_config(config)
+        assert result == ["--no-enable-prefix-caching"]
+
+    def test_other_bool_false_is_still_skipped(self):
+        config = {"disable-log-requests": False}
         result = build_cli_args_from_config(config)
         assert result == []
 

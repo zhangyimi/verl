@@ -56,4 +56,21 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+
+    # One-shot route diagnostics run on an already-started multi-node Ray
+    # cluster.  Arbitrary variables from the submitting shell are not
+    # guaranteed to reach the controller/worker actors, so explicitly carry
+    # the narrowly-scoped diagnostic switches in Ray's runtime environment.
+    for key in (
+        "VERL_ROUTE_DIAG",
+        "VERL_ROUTE_DIAG_ONLY",
+        "VERL_ROUTE_DIAG_SKIP_DATA_STATE",
+        "VERL_ROUTE_DIAG_TOPK",
+        "VERL_ROUTE_REPLAY_COUNTERFACTUAL",
+        "VERL_ROLLOUT_ROUTE_CAPTURE",
+        "VERL_REQUIRE_UPSTREAM_ROUTE_CAPTURE",
+        "VERL_SKIP_DATA_STATE",
+    ):
+        if (value := os.environ.get(key)) is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

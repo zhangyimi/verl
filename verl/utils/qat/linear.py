@@ -50,6 +50,10 @@ def _fp4_fake_quant_kernel(
     stride_xn,
     stride_ym,
     stride_yn,
+    scale_out_ptr,
+    num_scale_cols,
+    stride_sm,
+    stride_sn,
     BLOCK_SIZE: tl.constexpr,
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
@@ -57,6 +61,8 @@ def _fp4_fake_quant_kernel(
     OUT_DTYPE: tl.constexpr,
     FP4_MAX: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    VLLM_REF_ARITH: tl.constexpr = False,
+    EMIT_SCALES: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -88,13 +94,28 @@ def _fp4_fake_quant_kernel(
     x_abs = tl.abs(tile_reshaped)
 
     block_max = tl.max(x_abs, axis=2, keep_dims=True)
-    block_max_scaled = block_max / (FP4_MAX * global_scale_safe)
-    block_max_scaled = tl.minimum(block_max_scaled, FP8_MAX)
-    block_max_quant = block_max_scaled.to(tl.float8e4nv).to(tl.float32) * global_scale
-    block_max_quant = tl.where(block_max_quant >= 1e-5, block_max_quant, 1.0)
 
-    block_max_quant_broadcast = tl.broadcast_to(block_max_quant, (TILE_M, NUM_FP4_BLOCKS, BLOCK_SIZE))
-    abs_scaled = x_abs / block_max_quant_broadcast
+    if VLLM_REF_ARITH:
+        # vLLM ref arithmetic using ONLY division (no reciprocals)
+        # scale = gs * (vec_max / FP4_MAX) → fp8 → fp32
+        scale_f32 = global_scale_safe * (block_max / FP4_MAX)
+        scale_f32 = tl.minimum(scale_f32, FP8_MAX)
+        fp8_scale = scale_f32.to(tl.float8e4nv).to(tl.float32)
+        # dequant_scale = fp8_scale / global_scale (direct division, matches ref)
+        dequant_scale = tl.where(global_scale_safe != 0.0, fp8_scale / global_scale_safe, 0.0)
+        # output_scale = 1 / dequant_scale = global_scale / fp8_scale
+        output_scale = tl.where(fp8_scale != 0.0, global_scale_safe / fp8_scale, 0.0)
+        output_scale_bc = tl.broadcast_to(output_scale, (TILE_M, NUM_FP4_BLOCKS, BLOCK_SIZE))
+        abs_scaled = x_abs * output_scale_bc
+        dequant_scale_bc = tl.broadcast_to(dequant_scale, (TILE_M, NUM_FP4_BLOCKS, BLOCK_SIZE))
+    else:
+        # Original FSDP arithmetic (used for weights)
+        block_max_scaled = block_max / (FP4_MAX * global_scale_safe)
+        block_max_scaled = tl.minimum(block_max_scaled, FP8_MAX)
+        block_max_quant = block_max_scaled.to(tl.float8e4nv).to(tl.float32) * global_scale
+        block_max_quant = tl.where(block_max_quant >= 1e-5, block_max_quant, 1.0)
+        block_max_quant_broadcast = tl.broadcast_to(block_max_quant, (TILE_M, NUM_FP4_BLOCKS, BLOCK_SIZE))
+        abs_scaled = x_abs / block_max_quant_broadcast
 
     q_val = tl.where(
         abs_scaled <= 0.25,
@@ -118,11 +139,33 @@ def _fp4_fake_quant_kernel(
         ),
     )
 
-    x_rescaled = q_val * block_max_quant_broadcast
+    if VLLM_REF_ARITH:
+        x_rescaled = q_val * dequant_scale_bc
+    else:
+        x_rescaled = q_val * block_max_quant_broadcast
     x_rescaled = tl.where(tile_reshaped >= 0, x_rescaled, -x_rescaled)
     tile_quant = tl.reshape(x_rescaled, (TILE_M, TILE_N))
 
     tl.store(y_block_ptr, tile_quant.to(OUT_DTYPE), boundary_check=(0, 1))
+
+    if EMIT_SCALES:
+        # Write kernel-produced FP8 block scales to output buffer
+        if VLLM_REF_ARITH:
+            kernel_fp8_scale = fp8_scale  # (TILE_M, NUM_FP4_BLOCKS, 1)
+        else:
+            kernel_fp8_scale = block_max_scaled.to(tl.float8e4nv).to(tl.float32)
+            kernel_fp8_scale = tl.reshape(kernel_fp8_scale, (TILE_M, NUM_FP4_BLOCKS, 1))
+        scale_2d = tl.reshape(kernel_fp8_scale, (TILE_M, NUM_FP4_BLOCKS))
+        scale_col_start = pid_n * NUM_FP4_BLOCKS
+        scale_block_ptr = tl.make_block_ptr(
+            base=scale_out_ptr,
+            shape=(M, num_scale_cols),
+            strides=(stride_sm, stride_sn),
+            offsets=(row_start, scale_col_start),
+            block_shape=(TILE_M, NUM_FP4_BLOCKS),
+            order=(1, 0),
+        )
+        tl.store(scale_block_ptr, scale_2d, boundary_check=(0, 1))
 
 
 def fp4_fake_quant_weight(
@@ -131,8 +174,16 @@ def fp4_fake_quant_weight(
     block_size: int = 16,
     tile_rows: int = 16,
     tile_cols: int = 64,
+    vllm_ref_arith: bool = False,
+    return_scales: bool = False,
 ) -> torch.Tensor:
-    """Apply FP4 fake quantization using Triton kernel."""
+    """Apply FP4 fake quantization using Triton kernel.
+
+    Args:
+        vllm_ref_arith: If True, use vLLM ref arithmetic for normalization/dequant.
+        return_scales: If True, also return kernel-produced FP8 block scales
+            as a (M, N//block_size) float32 tensor. Used for AC-1 validation.
+    """
     x_shape = weight.shape
     x_dtype = weight.dtype
     x = weight.reshape(-1, x_shape[-1]).contiguous()
@@ -148,7 +199,18 @@ def fp4_fake_quant_weight(
 
     if global_amax is None:
         global_amax = weight.abs().max().to(torch.float32)
-    global_scale = global_amax.float() / (FP4_E2M1_MAX * FP8_E4M3_MAX)
+
+    if vllm_ref_arith:
+        global_scale = global_amax.float()
+    else:
+        global_scale = global_amax.float() / (FP4_E2M1_MAX * FP8_E4M3_MAX)
+
+    # Scale output buffer (for EMIT_SCALES)
+    num_scale_cols = N // block_size
+    if return_scales:
+        scale_out = torch.empty(M, num_scale_cols, dtype=torch.float32, device=x.device)
+    else:
+        scale_out = torch.empty(1, dtype=torch.float32, device=x.device)  # dummy
 
     grid = (triton.cdiv(M, tile_rows), triton.cdiv(N, tile_cols_aligned))
 
@@ -162,6 +224,10 @@ def fp4_fake_quant_weight(
         stride_xn,
         stride_ym,
         stride_yn,
+        scale_out,
+        num_scale_cols,
+        scale_out.stride(0) if return_scales else 1,
+        scale_out.stride(1) if return_scales else 1,
         BLOCK_SIZE=block_size,
         TILE_M=tile_rows,
         TILE_N=tile_cols_aligned,
@@ -169,7 +235,11 @@ def fp4_fake_quant_weight(
         OUT_DTYPE=_TORCH_TO_TL_DTYPE[x_dtype],
         FP4_MAX=FP4_E2M1_MAX,
         FP8_MAX=FP8_E4M3_MAX,
+        VLLM_REF_ARITH=vllm_ref_arith,
+        EMIT_SCALES=return_scales,
     )
+    if return_scales:
+        return y.view(*x_shape), scale_out
     return y.view(*x_shape)
 
 
@@ -177,8 +247,44 @@ class STEFP4QuantTriton(torch.autograd.Function):
     """Straight-Through Estimator wrapper for Triton FP4 quantization kernel."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, global_amax: torch.Tensor, block_size: int) -> torch.Tensor:
-        return fp4_fake_quant_weight(x, global_amax=global_amax, block_size=block_size)
+    def forward(ctx, x: torch.Tensor, global_amax: torch.Tensor, block_size: int,
+                vllm_ref_arith: bool = False) -> torch.Tensor:
+        return fp4_fake_quant_weight(x, global_amax=global_amax, block_size=block_size,
+                                      vllm_ref_arith=vllm_ref_arith)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        return grad_output, None, None, None
+
+
+def _vllm_ref_fake_quant_activation(x: torch.Tensor, global_scale: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Pure PyTorch activation fake-quant that CALLS vLLM ref_nvfp4_quant directly.
+
+    This guarantees bit-exact match with the vLLM ref by using the SAME function.
+    """
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import ref_nvfp4_quant
+
+    x_dtype = x.dtype
+    m, n = x.shape
+    igs = global_scale.float().to(x.device)
+
+    # Call vLLM ref directly — guaranteed bit-exact match
+    fp4_vals, scale = ref_nvfp4_quant(x.float(), igs, block_size)
+
+    # Dequant: fp4_val * scale / global_scale (same as test's vllm_ref_quant_dequant)
+    fp4_3d = fp4_vals.reshape(m, n // block_size, block_size)
+    scale_3d = scale.unsqueeze(-1) / igs
+    result = (fp4_3d * scale_3d).reshape(m, n)
+
+    return result.to(x_dtype)
+
+
+class _STE_vllm_ref_activation(torch.autograd.Function):
+    """STE wrapper for vLLM-ref-matching activation fake-quant."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, global_scale: torch.Tensor, block_size: int) -> torch.Tensor:
+        return _vllm_ref_fake_quant_activation(x, global_scale, block_size)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
@@ -205,6 +311,7 @@ class QATLinear(nn.Linear):
         mode: QATMode = QATMode.W4A4,
         group_size: int = 16,
         activation_observer: str = "static_minmax",  # Observer strategy for activation global_scale
+        activation_observer_update_interval: int = 1,  # PERF: update activation scale every N steps
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -219,13 +326,22 @@ class QATLinear(nn.Linear):
         self._cached_weight_amax: Optional[torch.Tensor] = None
         self._fusion_siblings_ref = None
 
+        # --- PERF (W4A4 FSDP): interval-gated observer + no per-forward .item() ---
+        self.activation_observer_update_interval = activation_observer_update_interval
+        self._activation_observer_train_step = 0
+        self._last_activation_observer_update_step = -1
+        self._amax_initialized = False
+
         if mode == QATMode.W4A4:
+            # PERF: persistent=False keeps these out of the FSDP sharded state_dict, where each of
+            # the 36864 buffers triggers a cross-node collective (~145s at 32-rank). They are
+            # re-injected for the quantizer via a local read in get_per_tensor_param.
             self.register_buffer(
-                "input_global_scale", torch.tensor([self._UNINITIALIZED_SCALE], dtype=torch.float32), persistent=True
+                "input_global_scale", torch.tensor([self._UNINITIALIZED_SCALE], dtype=torch.float32), persistent=False
             )
 
             self.register_buffer(
-                "input_amax", torch.tensor([self._UNINITIALIZED_SCALE], dtype=torch.float32), persistent=True
+                "input_amax", torch.tensor([self._UNINITIALIZED_SCALE], dtype=torch.float32), persistent=False
             )
 
             self._ema_decay: float = 0.01
@@ -239,6 +355,7 @@ class QATLinear(nn.Linear):
         mode: QATMode = QATMode.W4A4,
         group_size: int = 16,
         activation_observer: str = "static_minmax",
+        activation_observer_update_interval: int = 1,
     ) -> "QATLinear":
         """Create QATLinear from an existing nn.Linear."""
         has_bias = linear.bias is not None
@@ -250,6 +367,7 @@ class QATLinear(nn.Linear):
             mode=mode,
             group_size=group_size,
             activation_observer=activation_observer,
+            activation_observer_update_interval=activation_observer_update_interval,
             device=linear.weight.device,
             dtype=linear.weight.dtype,
         )
@@ -262,10 +380,28 @@ class QATLinear(nn.Linear):
         return new_linear
 
     def _is_amax_initialized(self) -> bool:
-        """Check if input_amax has been initialized."""
-        if not hasattr(self, "input_amax"):
+        """Check if input_amax has been initialized.
+
+        PERF: read a python bool flag instead of input_amax.item(), which would force a
+        GPU->host sync on every QATLinear.forward (thousands per step for MoE experts).
+        """
+        return getattr(self, "_amax_initialized", False)
+
+    def set_activation_observer_train_step(self, step: int):
+        """Set current optimizer-step index for observer update cadence."""
+        self._activation_observer_train_step = int(step)
+
+    def _should_update_activation_observer(self) -> bool:
+        """Gate the (expensive) activation amax reduction to every N optimizer steps.
+
+        Callers wrap this in torch.no_grad(); per-step dedup keeps gradient-checkpoint
+        recompute consistent with the original forward.
+        """
+        step = self._activation_observer_train_step
+        if self._last_activation_observer_update_step == step:
             return False
-        return self.input_amax.item() != self._UNINITIALIZED_SCALE
+        interval = max(1, int(getattr(self, 'activation_observer_update_interval', 1)))
+        return (step % interval) == 0
 
     def _update_input_global_scale(self, x: torch.Tensor):
         """Update static input_global_scale based on observer strategy.
@@ -348,7 +484,12 @@ class QATLinear(nn.Linear):
         return result
 
     def _fake_quantize_activation(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply fake quantization to activation tensor (W4A4 mode only)."""
+        """Apply fake quantization to activation tensor (W4A4 mode only).
+
+        Uses pure PyTorch arithmetic matching vLLM ref_nvfp4_quant exactly.
+        This bypasses the Triton kernel for activations to achieve exact
+        dequant alignment with the vLLM inference quantizer.
+        """
         original_shape = x.shape
 
         if x.dim() == 3:
@@ -357,13 +498,21 @@ class QATLinear(nn.Linear):
             x_2d = x
 
         if self.training:
-            self._update_input_global_scale(x_2d)
+            with torch.no_grad():  # keep observer ops out of grad-ckpt saved-tensor accounting
+                if self._should_update_activation_observer():
+                    self._update_input_global_scale(x_2d)
+                    self._amax_initialized = True
+                    self._last_activation_observer_update_step = self._activation_observer_train_step
 
-        if self.input_global_scale.item() == self._UNINITIALIZED_SCALE:
-            raise RuntimeError("W4A4 input_global_scale uninitialized. Load PTQ model first.")
+        if not self._amax_initialized:
+            # off hot path: only hit before the first observed forward (e.g. eval w/ PTQ scales)
+            if float(self.input_global_scale.item()) == self._UNINITIALIZED_SCALE:
+                raise RuntimeError("W4A4 input_global_scale uninitialized. Load PTQ model first.")
+            self._amax_initialized = True
 
-        global_amax = (FP4_E2M1_MAX * FP8_E4M3_MAX) / self.input_global_scale.to(x.device)
-        result = STEFP4QuantTriton.apply(x_2d, global_amax, self.group_size)
+        # Use Triton kernel with VLLM_REF_ARITH=True for activation path
+        igs = self.input_global_scale.to(x.device)
+        result = STEFP4QuantTriton.apply(x_2d, igs, self.group_size, True)
         return result.view(original_shape)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

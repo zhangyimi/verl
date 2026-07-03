@@ -85,6 +85,305 @@ loss_agg_mode: token-mean
 # If null, uses response_length. Set to a constant to ensure consistent normalization.
 loss_scale_factor: null
 
+# Enable per-token policy-gradient downweighting based on FSDP/vLLM logprob gap.
+pg_mask_enable: false
+
+# Lower logprob-gap threshold for policy-gradient downweighting.
+pg_mask_delta_min: null
+
+# Upper logprob-gap threshold for policy-gradient downweighting.
+pg_mask_delta_max: null
+
+# Weight applied to policy-gradient tokens selected by pg_mask thresholds.
+pg_mask_bad_weight: 0.0
+
+# Enable auxiliary FSDP/vLLM logprob alignment loss.
+vllm_align_enable: false
+
+# Coefficient for auxiliary FSDP/vLLM logprob alignment loss.
+vllm_align_coef: 0.0
+
+# Token objective for auxiliary alignment: k3, huber, mse, or abs.
+vllm_align_loss_type: k3
+
+# Lower logprob-gap threshold for auxiliary alignment.
+vllm_align_delta_min: null
+
+# Upper logprob-gap threshold for auxiliary alignment.
+vllm_align_delta_max: null
+
+# Lower absolute logprob-gap threshold for auxiliary alignment.
+vllm_align_abs_delta_min: null
+
+# Upper absolute logprob-gap threshold for auxiliary alignment.
+vllm_align_abs_delta_max: null
+
+# Lower advantage threshold for auxiliary alignment.
+vllm_align_adv_min: null
+
+# Upper advantage threshold for auxiliary alignment.
+vllm_align_adv_max: null
+
+# Restrict auxiliary alignment to positive segment-gate tokens.
+vllm_align_segment_pos_enable: false
+
+# Huber beta used when vllm_align_loss_type is huber.
+vllm_align_huber_beta: 1.0
+
+# Normalize auxiliary alignment by active window tokens instead of all response tokens.
+vllm_align_normalize_by_window: false
+
+# Minimum denominator fraction when normalizing auxiliary alignment by active window.
+vllm_align_min_window_fraction: 0.0
+
+# Optional cap for per-token auxiliary alignment objective.
+vllm_align_loss_cap: null
+
+# Enable hard-tail auxiliary FSDP/vLLM logprob alignment loss.
+vllm_align_hard_enable: false
+
+# Coefficient for hard-tail auxiliary alignment loss.
+vllm_align_hard_coef: 0.0
+
+# Token objective for hard-tail auxiliary alignment.
+vllm_align_hard_loss_type: huber
+
+# Lower logprob-gap threshold for hard-tail auxiliary alignment.
+vllm_align_hard_delta_min: null
+
+# Upper logprob-gap threshold for hard-tail auxiliary alignment.
+vllm_align_hard_delta_max: null
+
+# Lower absolute logprob-gap threshold for hard-tail auxiliary alignment.
+vllm_align_hard_abs_delta_min: null
+
+# Upper absolute logprob-gap threshold for hard-tail auxiliary alignment.
+vllm_align_hard_abs_delta_max: null
+
+# Huber beta used by hard-tail auxiliary alignment.
+vllm_align_hard_huber_beta: 1.0
+
+# Normalize hard-tail auxiliary alignment by active window tokens.
+vllm_align_hard_normalize_by_window: false
+
+# Optional cap for hard-tail per-token auxiliary alignment objective.
+vllm_align_hard_loss_cap: null
+
+# Enable mean logprob-gap guard to prevent train/rollout IS drift.
+delta_mean_guard_enable: false
+
+# Coefficient for mean logprob-gap guard.
+delta_mean_guard_coef: 0.0
+
+# Target lower bound for mean(logp_train - logp_vllm).
+delta_mean_guard_target: -0.01
+
+# Guard aggregation mode: token or seq.
+delta_mean_guard_mode: token
+
+# Optional logprob-gap window for mean guard.
+delta_mean_guard_delta_min: null
+delta_mean_guard_delta_max: null
+
+# Optional advantage window for mean guard.
+delta_mean_guard_adv_min: null
+delta_mean_guard_adv_max: null
+
+# Optional cap for mean guard scalar loss.
+delta_mean_guard_loss_cap: null
+
+# Enable per-sequence adaptive denominator for seq-mean-token-sum-norm.
+seq_norm_adaptive_enable: false
+
+# Response-length quantile used to choose the short-sequence denominator.
+seq_norm_adaptive_quantile: 0.95
+
+# EMA beta for the response-length quantile.
+seq_norm_adaptive_ema_beta: 0.9
+
+# Internal EMA state for adaptive sequence normalization.
+seq_norm_adaptive_quantile_ema: null
+
+# P95 buckets and denominators for adaptive sequence normalization.
+seq_norm_adaptive_threshold_1: 4096.0
+seq_norm_adaptive_threshold_2: 8192.0
+seq_norm_adaptive_threshold_3: 12288.0
+seq_norm_adaptive_denom_1: 8192.0
+seq_norm_adaptive_denom_2: 12288.0
+seq_norm_adaptive_denom_3: 16384.0
+seq_norm_adaptive_denom_4: 20480.0
+seq_norm_adaptive_tail_denom: 20480.0
+seq_norm_adaptive_tail_power: 0.0
+
+# Enable local segment mean-gap align loss. This averages over all valid segments,
+# with non-triggered segments contributing zero penalty.
+local_segment_align_enable: false
+
+# Coefficient for local segment mean-gap align.
+local_segment_align_coef: 0.0
+
+# Target lower bound for segment mean(logp_train - logp_vllm).
+local_segment_align_target: -0.03
+
+# Segment size for local segment align.
+local_segment_align_size: 128
+
+# Optional cap for each segment penalty before averaging.
+local_segment_align_loss_cap: null
+
+# Enable batch response-length gate for local segment align.
+local_segment_align_length_gate_enable: false
+
+# Batch response-length quantile used by the local segment align gate.
+local_segment_align_length_gate_quantile: 0.95
+
+# Minimum gated quantile length required before local segment align contributes.
+local_segment_align_length_gate_min: 8192.0
+
+# Minimum global response length mean required before local segment align contributes.
+local_segment_align_length_gate_mean_min: 7000.0
+
+# Minimum global response length clip ratio required before local segment align contributes.
+local_segment_align_length_gate_clip_ratio_min: 0.02
+
+# Enable rollout-KL soft gate for local segment align.
+local_segment_align_kl_gate_enable: false
+
+# Rollout-KL value where local segment align starts ramping up.
+local_segment_align_kl_gate_start: 0.01
+
+# Rollout-KL value where local segment align reaches max factor.
+local_segment_align_kl_gate_full: 0.02
+
+# Minimum multiplier for local segment align under the rollout-KL soft gate.
+local_segment_align_kl_gate_min_factor: 0.0
+
+# Maximum multiplier for local segment align under the rollout-KL soft gate.
+local_segment_align_kl_gate_max_factor: 1.0
+
+# Enable adaptive tail weighting for local segment align.
+local_segment_align_adaptive_tail_enable: false
+
+# Offset added to the full-step response length mean to start adaptive tail weighting.
+local_segment_align_adaptive_tail_offset: 4096.0
+
+# Lower bound for the adaptive tail start length.
+local_segment_align_adaptive_tail_min_start: 8192.0
+
+# Upper bound for the adaptive tail start length.
+local_segment_align_adaptive_tail_max_start: 14336.0
+
+# Ramp width from adaptive tail start to full weight.
+local_segment_align_adaptive_tail_width: 4096.0
+
+# Minimum full-step adaptive tail mass required before local segment align contributes.
+local_segment_align_adaptive_tail_mass_min: 0.02
+
+# Require full-step response clip ratio before adaptive tail align contributes.
+local_segment_align_adaptive_tail_clip_gate_enable: false
+
+# Minimum full-step response clip ratio for adaptive tail clip gate.
+local_segment_align_adaptive_tail_clip_ratio_min: 0.02
+
+# If true, adaptive tail only gates whether align runs; once active, all valid segments use uniform weight.
+local_segment_align_adaptive_tail_uniform_weight: false
+
+# Enable sequence-level mismatch gate for full-response policy loss downweighting.
+seq_mismatch_gate_enable: false
+
+# Lower bound for sequence mean old-learner minus rollout logprob gap.
+seq_mismatch_gate_delta_min: null
+
+# Upper bound for sequence mean old-learner minus rollout logprob gap.
+seq_mismatch_gate_delta_max: null
+
+# Upper bound for sequence mean current minus old logprob gap on negative-advantage responses.
+seq_mismatch_gate_neg_prox_delta_max: null
+
+# Maximum sequence advantage for applying negative-prox sequence gate.
+seq_mismatch_gate_neg_adv_max: 0.0
+
+# Policy-gradient weight for gated full responses.
+seq_mismatch_gate_bad_weight: 0.3
+
+# Enable sequence-level TBPO-style surrogate objective.
+seq_tbpo_enable: false
+
+# Upper sequence ratio clip for non-negative advantage responses.
+seq_tbpo_clip_ratio_high: 0.001
+
+# Lower sequence ratio clip width for negative advantage responses.
+seq_tbpo_neg_clip_ratio_low: 0.001
+
+# Upper sequence ratio clip width for negative advantage responses.
+seq_tbpo_neg_clip_ratio_high: 0.001
+
+# Two-sided cap for sequence-level mismatch importance weights.
+seq_tbpo_tis_imp_ratio_cap: 2.0
+
+# Enable response-length scaling for advantages.
+adv_length_norm_enable: false
+
+# Where advantage length shaping runs: disabled, loss (legacy), or
+# driver_group_recenter (GRPO-safe global shaping before actor dispatch).
+adv_length_norm_stage: loss
+
+# Which advantages to scale by response length: neg_only, pos_only, or all.
+adv_length_norm_mode: neg_only
+
+# Reference response length for advantage scaling.
+adv_length_norm_ref_len: 4096
+
+# Whole-update response-length quantile used as the adaptive advantage reference.
+# This is independent from seq_norm_adaptive_quantile.
+adv_length_norm_quantile: 0.95
+
+# Power used for response-length advantage scaling.
+adv_length_norm_alpha: 0.5
+
+# Minimum advantage scale.
+adv_length_norm_min_scale: 0.5
+
+# Maximum advantage scale.
+adv_length_norm_max_scale: 1.0
+
+# Enable segment-level downweighting based on logprob gap and advantage.
+seg_gate_enable: false
+
+# Segment size for segment-level gating.
+seg_gate_size: 128
+
+# Mean logprob-gap threshold for negative segment gating.
+seg_gate_neg_delta_threshold: -0.5
+
+# Maximum mean advantage for negative segment gating.
+seg_gate_neg_adv_max: 0.0
+
+# Weight applied to negative gated segments.
+seg_gate_neg_weight: 0.3
+
+# Mean logprob-gap threshold for severe segment gating.
+seg_gate_severe_delta_threshold: -1.5
+
+# Per-token logprob-gap threshold used to count bad-token fraction in a segment.
+seg_gate_bad_delta_threshold: -6.0
+
+# Bad-token fraction threshold for severe segment gating.
+seg_gate_bad_fraction_threshold: 0.02
+
+# Weight applied to severe gated segments.
+seg_gate_severe_weight: 0.1
+
+# Enable positive-advantage segment selection.
+seg_gate_pos_enable: false
+
+# Mean logprob-gap threshold for positive segment selection.
+seg_gate_pos_delta_threshold: -0.5
+
+# Minimum mean advantage for positive segment selection.
+seg_gate_pos_adv_min: 0.0
+
+
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
@@ -258,4 +557,3 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
-

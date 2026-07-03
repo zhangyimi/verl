@@ -198,6 +198,7 @@ class QATEngineConfig(BaseConfig):
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
+    activation_observer_update_interval: int = 1  # PERF (W4A4): update activation amax every N optimizer steps
     quantization_config_path: Optional[str] = None
 
 

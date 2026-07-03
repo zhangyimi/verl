@@ -62,6 +62,19 @@ strategy: fsdp
 # Mixed precision training param dtype
 dtype: bfloat16 # ["bfloat16", "float16"]
 
+# Router replay configuration for MoE models.  FSDP currently supports the R3
+# mode: use rollout expert ids in both old-logprob and actor-update forwards.
+router_replay:
+
+  _target_: verl.workers.config.EngineRouterReplayConfig
+
+  # disabled or R3 (R2 is a Megatron-only record/replay mode)
+  mode: disabled
+
+  record_file: null
+
+  replay_file: null
+
 # QAT (Quantization-Aware Training) configuration
 qat:
 

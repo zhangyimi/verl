@@ -274,6 +274,7 @@ def test_offpolicy_metrics():
         "training_ppl",
         "training_log_ppl",
         "kl",
+        "logprob_abs_diff",
         "k3_kl",
         "rollout_ppl",
         "rollout_log_ppl",
@@ -296,6 +297,9 @@ def test_offpolicy_metrics():
     print(f"   PPL ratio: {metrics['ppl_ratio']:.4f}")
     print(f"   ✓ All {len(expected_metrics)} off-policy metrics present")
 
+    expected_abs_diff = torch.abs(old_log_prob - rollout_log_prob).mean().item()
+    assert metrics["logprob_abs_diff"] == pytest.approx(expected_abs_diff)
+
     # Test without rollout log probs
     metrics_no_rollout = compute_offpolicy_metrics(
         old_log_prob=old_log_prob,
@@ -305,6 +309,7 @@ def test_offpolicy_metrics():
 
     assert "training_ppl" in metrics_no_rollout
     assert "rollout_ppl" not in metrics_no_rollout
+    assert "logprob_abs_diff" not in metrics_no_rollout
     print("   ✓ Off-policy metrics work without rollout log probs")
 
 

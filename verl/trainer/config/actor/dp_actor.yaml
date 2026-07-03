@@ -78,5 +78,9 @@ qat:
   # Activation observer for W4A4 mode: "static_minmax", "memoryless_minmax", or "minmax"
   activation_observer: "static_minmax"
 
+  # PERF (W4A4): update the activation amax observer every N optimizer steps (1 = every forward).
+  # 8 ~ matches customer production; gates the per-expert amax reduction that dominates the FSDP forward.
+  activation_observer_update_interval: 1
+
   # Path to vLLM quantization config JSON file
   quantization_config_path: null

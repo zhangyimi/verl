@@ -21,6 +21,7 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    compute_length_quantile_refs,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -28,7 +29,73 @@ from verl.trainer.ppo.core_algos import (
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
     register_adv_est,
+    validate_global_length_population,
 )
+
+
+def test_adv_p70_and_seq_p95_are_independent_and_partition_invariant():
+    partitions = [
+        torch.tensor([1024.0, 2048.0, 4096.0]),
+        torch.tensor([6144.0, 8192.0]),
+        torch.tensor([12288.0, 16384.0, 20480.0]),
+    ]
+    global_lengths = torch.cat(partitions)
+
+    adv_ref, seq_ref = compute_length_quantile_refs(
+        global_lengths,
+        adv_enabled=True,
+        adv_quantile=0.70,
+        seq_enabled=True,
+        seq_quantile=0.95,
+    )
+
+    assert adv_ref == pytest.approx(float(torch.quantile(global_lengths, 0.70)))
+    assert seq_ref == pytest.approx(float(torch.quantile(global_lengths, 0.95)))
+    assert adv_ref != seq_ref
+
+    # Repartitioning cannot change a whole-update reference; production does
+    # the same concatenation after DP all_gather_object.
+    repartitioned = [global_lengths[::2], global_lengths[1::2]]
+    adv_repartitioned, seq_repartitioned = compute_length_quantile_refs(
+        torch.cat(repartitioned).sort().values,
+        adv_enabled=True,
+        adv_quantile=0.70,
+        seq_enabled=True,
+        seq_quantile=0.95,
+    )
+    assert adv_repartitioned == pytest.approx(adv_ref)
+    assert seq_repartitioned == pytest.approx(seq_ref)
+
+
+def test_adv_p70_does_not_enable_seq_reference():
+    adv_ref, seq_ref = compute_length_quantile_refs(
+        torch.tensor([0.0, 1000.0, 2000.0, 3000.0, float("nan")]),
+        adv_enabled=True,
+        adv_quantile=0.70,
+        seq_enabled=False,
+        seq_quantile=0.95,
+    )
+    assert adv_ref == pytest.approx(float(torch.quantile(torch.tensor([1000.0, 2000.0, 3000.0]), 0.70)))
+    assert seq_ref is None
+
+
+def test_global_length_population_requires_every_dp_sample_once_and_active():
+    payloads = [
+        {"total": 3, "active": 3, "lengths": [1024.0, 2048.0, 4096.0]},
+        {"total": 3, "active": 3, "lengths": [6144.0, 8192.0, 12288.0]},
+    ]
+    assert validate_global_length_population(payloads, batch_size_per_dp=3, dp_size=2) == [
+        1024.0,
+        2048.0,
+        4096.0,
+        6144.0,
+        8192.0,
+        12288.0,
+    ]
+
+    payloads[1] = {"total": 3, "active": 2, "lengths": [6144.0, 8192.0]}
+    with pytest.raises(RuntimeError, match="rank_counts"):
+        validate_global_length_population(payloads, batch_size_per_dp=3, dp_size=2)
 
 
 def mock_test_fn():
