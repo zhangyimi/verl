@@ -47,6 +47,33 @@ from verl.workers.rollout.utils import ensure_async_iterator
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+def _ignore_patterns_to_exclude_modules(patterns) -> list[str]:
+    """Translate verl QAT ignore_patterns into TRT-LLM exclude_modules globs.
+
+    Verl supports `"substring"` and `"re:<regex>"` forms; TRT-LLM expects
+    glob-style names. We approximate:
+      - "re:.*X$"  -> "*X"
+      - "re:.*X.*" / "re:.*X" -> "*X*"
+      - "X"        -> "*X*"
+    """
+    if not patterns:
+        return []
+    out: list[str] = []
+    for p in patterns:
+        if p.startswith("re:"):
+            r = p[3:]
+            r = r[2:] if r.startswith(".*") else r
+            if r.endswith(".*"):
+                out.append("*" + r[:-2] + "*")
+            elif r.endswith("$"):
+                out.append("*" + r[:-1])
+            else:
+                out.append("*" + r + "*")
+        else:
+            out.append(f"*{p}*")
+    return out
+
 # Default configuration constants
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_ATTEMPTS = 3
@@ -206,6 +233,15 @@ class AsyncTRTLLMHttpAdapter:
                             return response.status if return_status else await _read_async_response(response)
                     else:
                         async with session.post(url, json=payload or {}, timeout=timeout) as response:
+                            if response.status >= 400:
+                                # Surface server-side error body before raising
+                                try:
+                                    _body = await response.text()
+                                except Exception:
+                                    _body = "<unreadable>"
+                                logger.error(
+                                    f"HTTP {response.status} from {endpoint}: {_body[:4000]}"
+                                )
                             response.raise_for_status()
                             return response.status if return_status else await _read_async_response(response)
 
@@ -291,15 +327,25 @@ class ServerAdapter(BaseRollout):
     def __init__(
         self, config: RolloutConfig, model_config: HFModelConfig, device_mesh: DeviceMesh, replica_rank: int = -1
     ):
-        if config.get("quantization", None) == "fp8":
+        _quantization = config.get("quantization", None)
+        if _quantization == "fp8":
             FP8_BLOCK_QUANT_KWARGS = {
                 "activation_scheme": "dynamic",
                 "fmt": "e4m3",
                 "quant_method": "fp8",
                 "weight_block_size": [128, 128],
             }
-            fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
-            model_config.hf_config.quantization_config = fp8_block_quant_kwargs
+            model_config.hf_config.quantization_config = dict(FP8_BLOCK_QUANT_KWARGS)
+        elif _quantization == "w4a8":
+            w4a8_cfg = {
+                "producer": {"name": "modelopt"},
+                "quant_algo": "W4A8_NVFP4_FP8",
+                "group_size": 32,
+            }
+            _excl = _ignore_patterns_to_exclude_modules(config.get("quantization_exclude_modules", None))
+            if _excl:
+                w4a8_cfg["exclude_modules"] = _excl
+            model_config.hf_config.quantization_config = w4a8_cfg
         super().__init__(config, model_config, device_mesh)
         self._adapter = None
         self.hybrid_device_mesh = None
@@ -496,8 +542,17 @@ class ServerAdapter(BaseRollout):
                 )
                 cur_available_bytes -= size_in_bytes
 
-            handle = reduce_tensor(param.detach())
-            cur_handles.append((name, handle))
+            # torch's legacy pickler (_pickle_storage_type) doesn't recognize
+            # float8_e4m3fn storage, so cuda IPC of fp8 tensors blows up at
+            # pickle.dumps. Send them as a uint8 view + a sentinel dtype tag
+            # and restore on the receive side.
+            _param = param.detach()
+            _orig_dtype_tag = None
+            if _param.dtype == torch.float8_e4m3fn:
+                _orig_dtype_tag = "float8_e4m3fn"
+                _param = _param.view(torch.uint8)
+            handle = reduce_tensor(_param)
+            cur_handles.append((name, handle, _orig_dtype_tag))
 
         await flush()
 

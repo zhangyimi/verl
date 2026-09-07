@@ -89,3 +89,8 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
+
+  # Output tensor naming convention for the actor→rollout weight sync:
+  # "vllm"   = compressed_tensors names (weight_global_scale, input_global_scale)
+  # "trtllm" = modelopt names (weight_scale_2, input_scale)
+  output_format: "vllm"

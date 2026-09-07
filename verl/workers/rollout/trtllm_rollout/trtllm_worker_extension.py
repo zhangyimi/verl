@@ -15,6 +15,8 @@ import base64
 import inspect
 from typing import Optional
 
+import torch
+
 # Defer tensorrt_llm imports to avoid FlashInfer's check_cuda_arch() crash
 # when this module is loaded on CPU-only Ray actors. The module is normally
 # loaded only on GPU workers via string path in trtllm_async_server.py, but
@@ -140,11 +142,19 @@ class WorkerExtension(TrtllmWorkerExtension):
                     # Data is already in the correct format (backward compatibility)
                     all_handles = serialized_handles
 
-                for param_name, tensor_handle in all_handles:
+                for _entry in all_handles:
+                    # Backward-compat: tolerate (name, handle) and (name, handle, dtype_tag).
+                    if len(_entry) == 3:
+                        param_name, tensor_handle, _dtype_tag = _entry
+                    else:
+                        param_name, tensor_handle = _entry
+                        _dtype_tag = None
                     func, args = tensor_handle
                     list_args = list(args)
                     list_args[6] = self.device_id
                     tensor = func(*list_args)
+                    if _dtype_tag == "float8_e4m3fn":
+                        tensor = tensor.view(torch.float8_e4m3fn)
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")

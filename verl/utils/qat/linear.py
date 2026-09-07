@@ -88,9 +88,19 @@ def _fp4_fake_quant_kernel(
     x_abs = tl.abs(tile_reshaped)
 
     block_max = tl.max(x_abs, axis=2, keep_dims=True)
-    block_max_scaled = block_max / (FP4_MAX * global_scale_safe)
-    block_max_scaled = tl.minimum(block_max_scaled, FP8_MAX)
-    block_max_quant = block_max_scaled.to(tl.float8e4nv).to(tl.float32) * global_scale
+    # TRT-LLM W4A8 NVFP4 export convention (match verl QATQuantizer
+    # compute_blockwise_scale, output_format="trtllm"): with global_scale =
+    # FP8_E4M3_MAX/amax (=448/amax),
+    #   weight_scale (fp8 block) = clamp(global_scale * block_max / FP4_MAX, FP8_MAX)
+    #   dequant block scale      = weight_scale / global_scale   (= fp8 * amax/448)
+    # The fp8 rounding now happens at the SAME magnitude the exporter rounds at,
+    # so the fake-quant weight matches the deployed/exported weight bit-for-bit
+    # (modulo e2m1 tie-breaking). The previous convention rounded block_max*448/amax
+    # — 6x higher in the FP8 range — yielding weights ~9% off the export.
+    block_scale = global_scale_safe * block_max / FP4_MAX
+    block_scale = tl.minimum(block_scale, FP8_MAX)
+    block_scale_fp8 = block_scale.to(tl.float8e4nv).to(tl.float32)
+    block_max_quant = block_scale_fp8 / global_scale_safe
     block_max_quant = tl.where(block_max_quant >= 1e-5, block_max_quant, 1.0)
 
     block_max_quant_broadcast = tl.broadcast_to(block_max_quant, (TILE_M, NUM_FP4_BLOCKS, BLOCK_SIZE))
@@ -148,7 +158,12 @@ def fp4_fake_quant_weight(
 
     if global_amax is None:
         global_amax = weight.abs().max().to(torch.float32)
-    global_scale = global_amax.float() / (FP4_E2M1_MAX * FP8_E4M3_MAX)
+    # TRT-LLM W4A8 NVFP4 convention: global scale = FP8_E4M3_MAX/amax (=448/amax),
+    # matching verl QATQuantizer(output_format="trtllm"). The kernel uses this as a
+    # multiplicative scale (numerator) per the export convention. (Was amax/2688,
+    # which placed the FP8 block-scale rounding 6x too high and made the training
+    # fake-quant diverge ~9% from the deployed export — the rollout/training gap.)
+    global_scale = FP8_E4M3_MAX / global_amax.float()
 
     grid = (triton.cdiv(M, tile_rows), triton.cdiv(N, tile_cols_aligned))
 

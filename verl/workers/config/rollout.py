@@ -279,6 +279,12 @@ class RolloutConfig(BaseConfig):
 
     quantization_config_file: Optional[str] = None
 
+    # Glob-style module names the TRT-LLM modelopt loader should skip when
+    # decoding the W4A8 checkpoint (e.g. "*lm_head*", "*embed_tokens*",
+    # "*mlp.gate", "*self_attn*"). Must match the actor-side qat.ignore_patterns
+    # so TRT-LLM doesn't expect packed weights for layers we left in bf16.
+    quantization_exclude_modules: Optional[list] = None
+
     enable_rollout_routing_replay: bool = False
 
     enable_sleep_mode: bool = True

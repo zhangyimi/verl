@@ -151,8 +151,24 @@ class TRTLLMHttpServer:
                 engine_kwargs["model_kwargs"] = {"quantization_config": FP8_BLOCK_QUANT_KWARGS}
                 if self.config.load_format != "dummy":
                     raise ValueError("FP8 quantization is only supported for dummy load format")
+            elif quantization == "w4a8":
+                from verl.workers.rollout.trtllm_rollout.trtllm_rollout import (
+                    _ignore_patterns_to_exclude_modules,
+                )
+
+                W4A8_NVFP4_FP8_KWARGS = {
+                    "producer": {"name": "modelopt"},
+                    "quant_algo": "W4A8_NVFP4_FP8",
+                    "group_size": 32,
+                }
+                _excl = _ignore_patterns_to_exclude_modules(
+                    self.config.get("quantization_exclude_modules", None)
+                )
+                if _excl:
+                    W4A8_NVFP4_FP8_KWARGS["exclude_modules"] = _excl
+                engine_kwargs["model_kwargs"] = {"quantization_config": W4A8_NVFP4_FP8_KWARGS}
             else:
-                raise ValueError(f"Currently only support fp8 quantization, got: {quantization}")
+                raise ValueError(f"Currently only support fp8/w4a8 quantization, got: {quantization}")
 
         llm_kwargs = {
             "model": self.model_config.local_path,

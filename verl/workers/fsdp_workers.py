@@ -285,9 +285,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
     def _init_qat_config(self):
-        """Initialize QAT configuration from actor.qat."""
+        """Initialize QAT configuration from actor.fsdp_config.qat.
+
+        The recipe override path is ``actor.fsdp_config.qat.*`` (FSDPEngineConfig
+        carries the QATEngineConfig field), so we must read from there rather
+        than ``actor.qat`` to pick up user overrides.
+        """
         try:
-            self.qat_config = self.config.actor.qat
+            self.qat_config = self.config.actor.fsdp_config.qat
             self._qat_enabled = self.qat_config.enable
             if self._qat_enabled:
                 logger.info(
@@ -849,10 +854,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 ignore_patterns=self.qat_config.ignore_patterns,
                 device=torch.device(get_device_id()),
                 param_dtype=self._param_dtype,
+                output_format=self.qat_config.get("output_format", "vllm"),
             )
             per_tensor_param = quantizer.quantize_with_fusion(
                 per_tensor_param,
-                target_device=torch.device("cpu"),
+                # TRT-LLM rollout reaches tensors via cuda IPC handles; emitting
+                # on CPU would route through rebuild_tensor (5-arg form) instead
+                # of rebuild_cuda_tensor (15-arg form) and TRT-LLM's receiver
+                # hard-codes args[6]=device_id → IndexError.
+                target_device=torch.device(get_device_id()),
             )
             aggressive_empty_cache(force_sync=True)
 
